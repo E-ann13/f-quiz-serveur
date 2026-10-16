@@ -1,0 +1,16 @@
+{
+  "name": "f-quiz-server",
+  "version": "1.0.0",
+  "description": "Serveur de salons F-QUIZ (multijoueur en ligne)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "license": "ISC",
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
