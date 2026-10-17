@@ -1,6 +1,6 @@
 {
   "name": "f-quiz-server",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Serveur de salons F-QUIZ (multijoueur en ligne)",
   "main": "server.js",
   "scripts": {

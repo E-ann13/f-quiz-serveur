@@ -1,5 +1,5 @@
 // F-QUIZ — serveur de salons pour le multijoueur en ligne
-// Rôle : relayer les messages entre les deux joueurs d'un salon. Le serveur ne connaît pas les avions secrets :
+// Rôle : relayer les messages entre les joueurs d'un salon (2 pour les duels, jusqu'à 8 pour le Grand Prix). Le serveur ne connaît pas les avions secrets :
 // chaque appareil répond lui-même aux questions sur son propre avion.
 //
 // Démarrage : node server.js   (port : variable PORT, 8787 par défaut)
@@ -13,6 +13,7 @@ const ROOM_TTL_MS = 2 * 60 * 60 * 1000;      // un salon inactif disparaît au b
 const RECONNECT_GRACE_MS = 3 * 60 * 1000;    // un joueur déconnecté garde sa place 3 min
 const MAX_MSG_BYTES = 64 * 1024;
 const MAX_MSGS_PER_10S = 120;
+const MAX_PLAYERS = 8;                         // duels à 2, Grand Prix jusqu'à 8
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // sans I, O, 0, 1 (confusions)
 
 const rooms = new Map(); // code -> {code, created, touched, players: [{id, token, name, ws, seat, leftAt}], log: []}
@@ -77,10 +78,11 @@ wss.on('connection', (ws) => {
           broadcastPresence(r);
           return;
         }
-        if (r.players.length >= 2) { send(ws, { t: 'error', code: 'full', msg: 'Ce salon est déjà complet' }); return; }
-        room = r; me = { id: rid(), token: rid(), name: String(m.name || 'Joueur 2').slice(0, 24), ws, seat: 2, leftAt: null };
-        r.players.push(me); r.touched = now;
-        send(ws, { t: 'joined', code, seat: 2, token: me.token, players: publicPlayers(r) });
+        if (r.players.length >= MAX_PLAYERS) { send(ws, { t: 'error', code: 'full', msg: 'Ce salon est déjà complet' }); return; }
+        let seat = 1; while (r.players.some(p => p.seat === seat)) seat++;
+        room = r; me = { id: rid(), token: rid(), name: String(m.name || ('Joueur ' + seat)).slice(0, 24), ws, seat, leftAt: null };
+        r.players.push(me); r.players.sort((x, y) => x.seat - y.seat); r.touched = now;
+        send(ws, { t: 'joined', code, seat, token: me.token, players: publicPlayers(r) });
         broadcastPresence(r);
         break;
       }
