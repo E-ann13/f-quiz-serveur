@@ -10,7 +10,7 @@ const { WebSocketServer } = require('ws');
 
 const PORT = +process.env.PORT || 8787;
 const ROOM_TTL_MS = 2 * 60 * 60 * 1000;      // un salon inactif disparaît au bout de 2 h
-const RECONNECT_GRACE_MS = 3 * 60 * 1000;    // un joueur déconnecté garde sa place 3 min
+const RECONNECT_GRACE_MS = 10 * 60 * 1000;   // un joueur déconnecté (appli en arrière-plan, coupure) garde sa place 10 min
 const MAX_MSG_BYTES = 64 * 1024;
 const MAX_MSGS_PER_10S = 120;
 const MAX_PLAYERS = 8;                         // duels à 2, Grand Prix jusqu'à 8
@@ -30,9 +30,25 @@ const rid = () => Math.random().toString(36).slice(2, 10) + Math.random().toStri
 const send = (ws, msg) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg)); };
 const others = (room, me) => room.players.filter(p => p !== me);
 const publicPlayers = room => room.players.map(p => ({ seat: p.seat, name: p.name, online: !!(p.ws && p.ws.readyState === 1) }));
+const hostOf = room => room.players.reduce((a, p) => (!a || p.seat < a.seat ? p : a), null);
+// Liste des salons pour l'écran « Jouer en ligne » : le code n'est donné que pour les salons publics
+function roomList() {
+  const out = [];
+  for (const r of rooms.values()) {
+    if (!r.players.some(p => p.ws && p.ws.readyState === 1)) continue;
+    const h = hostOf(r), m = r.meta || {};
+    out.push({ code: m.pub ? r.code : null, pub: !!m.pub, host: h ? h.name : '?', n: r.players.length, cap: m.cap || 2, game: m.game || 'radar', started: !!m.started, created: r.created });
+  }
+  return out.sort((a, b) => (b.pub - a.pub) || (a.started - b.started) || (b.created - a.created)).slice(0, 30).map(({ created, ...x }) => x);
+}
 function broadcastPresence(room) { room.players.forEach(p => send(p.ws, { t: 'presence', players: publicPlayers(room) })); }
 
 const server = http.createServer((req, res) => {
+  if (req.url === '/rooms') {
+    res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*', 'cache-control': 'no-store' });
+    res.end(JSON.stringify({ rooms: roomList() }));
+    return;
+  }
   if (req.url === '/health') {
     res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
     res.end(JSON.stringify({ ok: true, rooms: rooms.size, uptime: Math.round(process.uptime()) }));
@@ -59,7 +75,7 @@ wss.on('connection', (ws) => {
     switch (m.t) {
       case 'create': {
         const code = makeCode();
-        room = { code, created: now, touched: now, players: [], log: [] };
+        room = { code, created: now, touched: now, players: [], log: [], meta: { pub: false, game: 'radar', cap: 2, started: false } };
         me = { id: rid(), token: rid(), name: String(m.name || 'Joueur 1').slice(0, 24), ws, seat: 1, leftAt: null };
         room.players.push(me); rooms.set(code, room);
         send(ws, { t: 'joined', code, seat: 1, token: me.token, players: publicPlayers(room) });
@@ -78,6 +94,13 @@ wss.on('connection', (ws) => {
           broadcastPresence(r);
           return;
         }
+        // Entrée depuis la liste publique : le salon doit être ouvert, pas commencé, avec une place libre
+        if (m.pub) {
+          const mt = r.meta || {};
+          if (!mt.pub) { send(ws, { t: 'error', code: 'no-room', msg: 'Ce salon n’est plus public' }); return; }
+          if (mt.started) { send(ws, { t: 'error', code: 'full', msg: 'La partie a déjà commencé' }); return; }
+          if (r.players.length >= (mt.cap || MAX_PLAYERS)) { send(ws, { t: 'error', code: 'full', msg: 'Ce salon est déjà complet' }); return; }
+        }
         if (r.players.length >= MAX_PLAYERS) { send(ws, { t: 'error', code: 'full', msg: 'Ce salon est déjà complet' }); return; }
         let seat = 1; while (r.players.some(p => p.seat === seat)) seat++;
         room = r; me = { id: rid(), token: rid(), name: String(m.name || ('Joueur ' + seat)).slice(0, 24), ws, seat, leftAt: null };
@@ -94,6 +117,18 @@ wss.on('connection', (ws) => {
         room.log.push(out); if (room.log.length > 500) room.log.shift();
         others(room, me).forEach(p => send(p.ws, out));
         send(ws, { t: 'ack', seq: out.seq, ref: m.ref });
+        break;
+      }
+      case 'meta': {
+        // Réglages du salon envoyés par l'hôte (plus petit siège) : public / jeu / places / partie lancée
+        if (!room || !me || hostOf(room) !== me) return;
+        room.meta = {
+          pub: !!m.pub,
+          game: String(m.game || 'radar').slice(0, 12),
+          cap: Math.max(2, Math.min(MAX_PLAYERS, +m.cap || 2)),
+          started: !!m.started
+        };
+        room.touched = now;
         break;
       }
       case 'ping': send(ws, { t: 'pong', at: m.at }); break;
