@@ -97,7 +97,7 @@ const server = http.createServer((req, res) => {
   res.end('Serveur F-QUIZ en ligne.');
 });
 
-const wss = new WebSocketServer({ server, maxPayload: MAX_MSG_BYTES });
+const wss = new WebSocketServer({ server, maxPayload: XFER_MAX_BYTES + 4096 });
 
 wss.on('connection', (ws) => {
   let room = null, me = null, bucket = [];
@@ -110,8 +110,25 @@ wss.on('connection', (ws) => {
     if (bucket.length > MAX_MSGS_PER_10S) { send(ws, { t: 'error', code: 'flood', msg: 'Trop de messages' }); return; }
     let m; try { m = JSON.parse(raw); } catch (e) { return; }
     if (!m || typeof m.t !== 'string') return;
+    if (raw.length > MAX_MSG_BYTES && m.t !== 'xput') return;
 
     switch (m.t) {
+      // Même service que GET /rooms et /xfer, mais par WebSocket : pour les appareils (certains iPhone/iPad) qui bloquent les requêtes HTTP depuis un fichier local
+      case 'rooms': send(ws, { t: 'rooms', id: m.id, rooms: roomList() }); break;
+      case 'xput': {
+        const data = String(m.data || '');
+        if (!/^(FQZ\d-|FQSAVE\d\.)/.test(data) || data.length > XFER_MAX_BYTES) { send(ws, { t: 'xput', id: m.id, error: 'bad' }); break; }
+        if (xfers.size > 5000) { send(ws, { t: 'xput', id: m.id, error: 'busy' }); break; }
+        const code = makeXferCode(); xfers.set(code, { data, at: now });
+        send(ws, { t: 'xput', id: m.id, code, ttl: XFER_TTL_MS });
+        break;
+      }
+      case 'xget': {
+        const k = String(m.code || '').toUpperCase().replace(/[^A-Z0-9]/g, ''), x = xfers.get(k);
+        if (!x || now - x.at > XFER_TTL_MS) { xfers.delete(k); send(ws, { t: 'xget', id: m.id, error: 'not found' }); break; }
+        xfers.delete(k); send(ws, { t: 'xget', id: m.id, data: x.data });
+        break;
+      }
       case 'create': {
         const code = makeCode();
         room = { code, created: now, touched: now, players: [], log: [], meta: { pub: false, game: 'radar', cap: 2, started: false } };
