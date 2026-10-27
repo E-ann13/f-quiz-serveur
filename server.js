@@ -16,6 +16,20 @@ const MAX_MSGS_PER_10S = 120;
 const MAX_PLAYERS = 8;                         // duels à 2, Grand Prix jusqu'à 8
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // sans I, O, 0, 1 (confusions)
 
+// Transfert de compte : la progression est déposée 15 min sous un code court, lisible une seule fois
+const XFER_TTL_MS = 15 * 60 * 1000;
+const XFER_MAX_BYTES = 1024 * 1024;
+const xfers = new Map(); // code -> {data, at}
+function makeXferCode() {
+  for (let n = 0; n < 50; n++) {
+    let c = '';
+    for (let i = 0; i < 6; i++) c += CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)];
+    if (!xfers.has(c)) return c;
+  }
+  throw new Error('no code');
+}
+setInterval(() => { const now = Date.now(); for (const [k, v] of xfers) if (now - v.at > XFER_TTL_MS) xfers.delete(k); }, 60 * 1000).unref();
+
 const rooms = new Map(); // code -> {code, created, touched, players: [{id, token, name, ws, seat, leftAt}], log: []}
 
 function makeCode() {
@@ -44,6 +58,31 @@ function roomList() {
 function broadcastPresence(room) { room.players.forEach(p => send(p.ws, { t: 'presence', players: publicPlayers(room) })); }
 
 const server = http.createServer((req, res) => {
+  const cors = { 'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET,POST,OPTIONS', 'access-control-allow-headers': 'content-type', 'cache-control': 'no-store' };
+  if (req.method === 'OPTIONS') { res.writeHead(204, cors); res.end(); return; }
+  if (req.url === '/xfer' && req.method === 'POST') {
+    let body = '', big = false;
+    req.on('data', d => { if (big) return; body += d; if (body.length > XFER_MAX_BYTES) { big = true; res.writeHead(413, cors); res.end('{"error":"too big"}'); req.destroy(); } });
+    req.on('end', () => {
+      if (big) return;
+      if (!/^(FQZ\d-|FQSAVE\d\.)/.test(body)) { res.writeHead(400, { ...cors, 'content-type': 'application/json' }); res.end('{"error":"bad"}'); return; }
+      if (xfers.size > 5000) { res.writeHead(503, cors); res.end('{"error":"busy"}'); return; }
+      const code = makeXferCode();
+      xfers.set(code, { data: body, at: Date.now() });
+      res.writeHead(200, { ...cors, 'content-type': 'application/json' });
+      res.end(JSON.stringify({ code, ttl: XFER_TTL_MS }));
+    });
+    return;
+  }
+  const xm = req.url.match(/^\/xfer\/([A-Za-z0-9]{6})$/);
+  if (xm && req.method === 'GET') {
+    const k = xm[1].toUpperCase(), x = xfers.get(k);
+    if (!x || Date.now() - x.at > XFER_TTL_MS) { xfers.delete(k); res.writeHead(404, { ...cors, 'content-type': 'application/json' }); res.end('{"error":"not found"}'); return; }
+    xfers.delete(k);
+    res.writeHead(200, { ...cors, 'content-type': 'text/plain; charset=utf-8' });
+    res.end(x.data);
+    return;
+  }
   if (req.url === '/rooms') {
     res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*', 'cache-control': 'no-store' });
     res.end(JSON.stringify({ rooms: roomList() }));
