@@ -51,7 +51,7 @@ function roomList() {
   for (const r of rooms.values()) {
     if (!r.players.some(p => p.ws && p.ws.readyState === 1)) continue;
     const h = hostOf(r), m = r.meta || {};
-    out.push({ code: m.pub ? r.code : null, pub: !!m.pub, host: h ? h.name : '?', n: r.players.length, cap: m.cap || 2, game: m.game || 'radar', started: !!m.started, created: r.created });
+    out.push({ code: m.pub ? r.code : null, pub: !!m.pub, host: h ? h.name : '?', n: r.players.length, on: r.players.filter(p => p.ws && p.ws.readyState === 1).length, cap: m.cap || 2, game: m.game || 'radar', started: !!m.started, created: r.created });
   }
   return out.sort((a, b) => (b.pub - a.pub) || (a.started - b.started) || (b.created - a.created)).slice(0, 30).map(({ created, ...x }) => x);
 }
@@ -209,7 +209,13 @@ setInterval(() => {
   wss.clients.forEach(ws => { if (!ws.isAlive) return ws.terminate(); ws.isAlive = false; try { ws.ping(); } catch (e) {} });
   const now = Date.now();
   for (const [code, r] of rooms) {
-    r.players = r.players.filter(p => !(p.leftAt && now - p.leftAt > RECONNECT_GRACE_MS));
+    const gone = r.players.filter(p => p.leftAt && now - p.leftAt > RECONNECT_GRACE_MS);
+    if (gone.length) {
+      r.players = r.players.filter(p => !gone.includes(p));
+      // les joueurs restants voient tout de suite que la place est libérée
+      gone.forEach(g => r.players.forEach(p => send(p.ws, { t: 'left', seat: g.seat })));
+      if (r.players.length) broadcastPresence(r);
+    }
     if (!r.players.length || now - r.touched > ROOM_TTL_MS) rooms.delete(code);
   }
 }, 20000);
