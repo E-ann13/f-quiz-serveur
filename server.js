@@ -4,6 +4,7 @@
 //
 // Démarrage : node server.js   (port : variable PORT, 8787 par défaut)
 // Santé : GET /health → {"ok":true,...,"db":"upstash"|"memoire"}
+// v1.7 : page « Mon aéroclub » (clubm : membres du club)
 // v1.6 : recherche d'aéroclub (clubq) ; création de salon idempotente (plus de salon en double quand le serveur se réveille)
 // v1.5 : ligue des aéroclubs (lb club) et suggestions d'avions (sugg/sggl)
 // v1.4 : soirée club (salons jusqu'à 40 appareils)
@@ -160,10 +161,10 @@ async function clubUpdate(pid, clubName, xp, cmds) {
   let prev = null; try { prev = JSON.parse(await db(['GET', 'lbc:' + pid]) || 'null'); } catch (e) {}
   if (prev && prev.k === k) { const d = xp - (prev.xp || 0); if (k && d > 0) cmds.push(['ZINCRBY', 'lb:club', d, k]); }
   else {
-    if (prev && prev.k) { cmds.push(['ZINCRBY', 'lb:club', -(prev.xp || 0), prev.k], ['ZINCRBY', 'lb:clubn', -1, prev.k]); }
+    if (prev && prev.k) { cmds.push(['ZINCRBY', 'lb:club', -(prev.xp || 0), prev.k], ['ZINCRBY', 'lb:clubn', -1, prev.k], ['ZREM', 'lbcm:' + prev.k, pid]); }
     if (k) cmds.push(['ZINCRBY', 'lb:club', xp, k], ['ZINCRBY', 'lb:clubn', 1, k]);
   }
-  if (k) cmds.push(['SET', 'lbcn:' + k, name, 'NX']);
+  if (k) cmds.push(['SET', 'lbcn:' + k, name, 'NX'], ['ZADD', 'lbcm:' + k, xp, pid]); // membres du club (XP de chacun)
   cmds.push(k ? ['SET', 'lbc:' + pid, JSON.stringify({ k, xp: Math.max(xp, prev && prev.k === k ? prev.xp || 0 : 0) })] : ['DEL', 'lbc:' + pid]);
 }
 async function lbDel(m) {
@@ -194,6 +195,17 @@ async function clubSearch(m) {
   if (!hit.length) return { list: [] };
   const ex = await dbMany(hit.map(([k]) => ['GET', 'lbcn:' + k]).concat(hit.map(([k]) => ['ZSCORE', 'lb:club', k])));
   return { list: hit.map(([k, n], i) => ({ k, n: ex[i] || k, m: n, s: Math.max(0, +ex[hit.length + i] || 0), exact: k === q })) };
+}
+// page « Mon aéroclub » : membres (XP, grade, bannière), XP de la semaine, rang du club dans la ligue
+async function clubMembers(m) {
+  const k = normKey(cleanClub(m.club)); if (k.length < 2) return { error: 'bad' };
+  const res = await dbMany([['ZRANGE', 'lbcm:' + k, 0, 99, 'REV', 'WITHSCORES'], ['GET', 'lbcn:' + k], ['ZREVRANK', 'lb:club', k], ['ZSCORE', 'lb:club', k], ['ZCOUNT', 'lb:clubn', 1, '+inf']]);
+  const flat = res[0] || [], ids = []; for (let i = 0; i < flat.length; i += 2) ids.push([flat[i], +flat[i + 1]]);
+  const wk = 'lb:wxp:' + weekKey();
+  const ex = ids.length ? await dbMany(ids.map(([id]) => ['GET', 'lbp:' + id]).concat(ids.map(([id]) => ['ZSCORE', wk, id]))) : [];
+  const members = ids.map(([id, xp], i) => { let mt = {}; try { mt = JSON.parse(ex[i] || '{}') || {}; } catch (e) {}
+    return { n: mt.n || 'Pilote', av: mt.av || '', ban: mt.ban || '', g: mt.g || '', xp, w: Math.max(0, +ex[ids.length + i] || 0), me: id === m.pid }; });
+  return { name: res[1] || cleanClub(m.club), members, rank: res[2] === null || res[2] === undefined ? null : +res[2] + 1, total: Math.max(0, +res[3] || 0), clubs: +res[4] || 0 };
 }
 async function lbGet(m) {
   if (m.b === 'club') return clubGet(m);
@@ -271,7 +283,7 @@ async function suggList(m) {
   const ex = await dbMany(ks.map(([k]) => ['GET', 'sgn:' + k]).concat(okId(m.pid) ? ks.map(([k]) => ['SISMEMBER', 'sgv:' + k, m.pid]) : []));
   return { list: ks.map(([k, v], i) => ({ k, n: ex[i] || k, v, me: okId(m.pid) ? +ex[ks.length + i] === 1 : false })) };
 }
-const DATA_OPS = { clubq: clubSearch, sugg: suggAdd, sggl: suggList, lbput: lbPut, lbget: lbGet, lbdel: lbDel, cdel: cloudDel, cnew: cloudNew, cput: cloudPut, cget: cloudGet, clink: cloudLink, cjoin: cloudJoin };
+const DATA_OPS = { clubm: clubMembers, clubq: clubSearch, sugg: suggAdd, sggl: suggList, lbput: lbPut, lbget: lbGet, lbdel: lbDel, cdel: cloudDel, cnew: cloudNew, cput: cloudPut, cget: cloudGet, clink: cloudLink, cjoin: cloudJoin };
 
 const createdBy = new Map(); // identifiant de création -> code (évite les salons en double après une coupure)
 const rooms = new Map(); // code -> {code, created, touched, players: [{id, token, name, ws, seat, leftAt}], log: []}
