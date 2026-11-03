@@ -25,7 +25,8 @@ const roomCap = r => (r.meta && r.meta.game === 'club') ? CLUB_MAX : MAX_PLAYERS
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // sans I, O, 0, 1 (confusions)
 
 // Transfert de compte : la progression est déposée 15 min sous un code court, lisible une seule fois
-const XFER_TTL_MS = 15 * 60 * 1000;
+const XFER_TTL_MS = 30 * 60 * 1000;
+const XFER_GRACE_S = 600; // après la première lecture, le code reste valable 10 min (nouvel essai si le réseau a coupé)
 const XFER_MAX_BYTES = 1024 * 1024;
 const xfers = new Map(); // code -> {data, at}
 function makeXferCode() {
@@ -260,7 +261,7 @@ async function cloudLink(m) {
   if (!(await cAuth(m.acc, m.s))) return { error: 'auth' };
   for (let n = 0; n < 20; n++) {
     let c = ''; for (let i = 0; i < 6; i++) c += CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)];
-    if ((await db(['SET', 'clink:' + c, JSON.stringify({ acc: m.acc, s: m.s }), 'EX', 900, 'NX'])) === 'OK') return { code: c, ttl: XFER_TTL_MS };
+    if ((await db(['SET', 'clink:' + c, JSON.stringify({ acc: m.acc, s: m.s }), 'EX', Math.round(XFER_TTL_MS / 1000), 'NX'])) === 'OK') return { code: c, ttl: XFER_TTL_MS };
   }
   return { error: 'busy' };
 }
@@ -268,7 +269,7 @@ async function cloudJoin(m) {
   const c = String(m.code || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
   const v = await db(['GET', 'clink:' + c]);
   if (!v) return { error: 'not found' };
-  await db(['DEL', 'clink:' + c]);
+  await db(['EXPIRE', 'clink:' + c, XFER_GRACE_S]);
   return JSON.parse(v);
 }
 // ---------- Suggestions d'avions à ajouter (une voix par joueur et par avion) ----------
@@ -375,6 +376,23 @@ async function lbAdmin(m) {
   const metas = ids.length ? await db(['MGET'].concat(ids.map(x => 'lbp:' + x[0]))) : [];
   return { list: ids.map(([pid, xp], i) => { let mt = {}; try { mt = JSON.parse(metas[i] || '{}') || {}; } catch (e) {} return { pid, xp, n: mt.n || 'Pilote', av: mt.av || '', g: mt.g || '', c: mt.c || '', at: mt.at || 0 }; }) };
 }
+// ---------- Transfert de progression : dans la base (survit aux redémarrages du serveur), en mémoire en secours ----------
+async function xferPut(data) {
+  const code = makeXferCode();
+  if (DB_ON && data.length < 900 * 1024) {
+    try { if ((await db(['SET', 'xf:' + code, data, 'EX', Math.round(XFER_TTL_MS / 1000), 'NX'])) === 'OK') return code; } catch (e) { console.error('xfer db', e.message); }
+  }
+  xfers.set(code, { data, at: Date.now() });
+  return code;
+}
+async function xferGet(k) {
+  k = String(k || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (DB_ON) { try { const v = await db(['GET', 'xf:' + k]); if (v) { await db(['EXPIRE', 'xf:' + k, XFER_GRACE_S]); return v; } } catch (e) { console.error('xfer db', e.message); } }
+  const x = xfers.get(k);
+  if (!x || Date.now() - x.at > XFER_TTL_MS) { xfers.delete(k); return null; }
+  x.at = Math.min(x.at, Date.now() - XFER_TTL_MS + XFER_GRACE_S * 1000);
+  return x.data;
+}
 const DATA_OPS = { lbadm: lbAdmin, lgnew: lgNew, lgjoin: lgJoin, lgget: lgGet, lgput: lgPut, lgleave: lgLeave, clubm: clubMembers, clubq: clubSearch, sugg: suggAdd, sggl: suggList, lbput: lbPut, lbget: lbGet, lbdel: lbDel, cdel: cloudDel, cnew: cloudNew, cput: cloudPut, cget: cloudGet, clink: cloudLink, cjoin: cloudJoin };
 
 const createdBy = new Map(); // identifiant de création -> code (évite les salons en double après une coupure)
@@ -415,20 +433,17 @@ const server = http.createServer((req, res) => {
       if (big) return;
       if (!/^(FQZ\d-|FQSAVE\d\.)/.test(body)) { res.writeHead(400, { ...cors, 'content-type': 'application/json' }); res.end('{"error":"bad"}'); return; }
       if (xfers.size > 5000) { res.writeHead(503, cors); res.end('{"error":"busy"}'); return; }
-      const code = makeXferCode();
-      xfers.set(code, { data: body, at: Date.now() });
-      res.writeHead(200, { ...cors, 'content-type': 'application/json' });
-      res.end(JSON.stringify({ code, ttl: XFER_TTL_MS }));
+      xferPut(body).then(code => { res.writeHead(200, { ...cors, 'content-type': 'application/json' }); res.end(JSON.stringify({ code, ttl: XFER_TTL_MS })); },
+        () => { res.writeHead(503, cors); res.end('{"error":"busy"}'); });
     });
     return;
   }
   const xm = req.url.match(/^\/xfer\/([A-Za-z0-9]{6})$/);
   if (xm && req.method === 'GET') {
-    const k = xm[1].toUpperCase(), x = xfers.get(k);
-    if (!x || Date.now() - x.at > XFER_TTL_MS) { xfers.delete(k); res.writeHead(404, { ...cors, 'content-type': 'application/json' }); res.end('{"error":"not found"}'); return; }
-    xfers.delete(k);
-    res.writeHead(200, { ...cors, 'content-type': 'text/plain; charset=utf-8' });
-    res.end(x.data);
+    xferGet(xm[1]).then(data => {
+      if (!data) { res.writeHead(404, { ...cors, 'content-type': 'application/json' }); res.end('{"error":"not found"}'); return; }
+      res.writeHead(200, { ...cors, 'content-type': 'text/plain; charset=utf-8' }); res.end(data);
+    }, () => { res.writeHead(503, cors); res.end('{"error":"busy"}'); });
     return;
   }
   if (req.url === '/rooms') {
@@ -471,14 +486,11 @@ wss.on('connection', (ws) => {
         const data = String(m.data || '');
         if (!/^(FQZ\d-|FQSAVE\d\.)/.test(data) || data.length > XFER_MAX_BYTES) { send(ws, { t: 'xput', id: m.id, error: 'bad' }); break; }
         if (xfers.size > 5000) { send(ws, { t: 'xput', id: m.id, error: 'busy' }); break; }
-        const code = makeXferCode(); xfers.set(code, { data, at: now });
-        send(ws, { t: 'xput', id: m.id, code, ttl: XFER_TTL_MS });
+        xferPut(data).then(code => send(ws, { t: 'xput', id: m.id, code, ttl: XFER_TTL_MS }), () => send(ws, { t: 'xput', id: m.id, error: 'busy' }));
         break;
       }
       case 'xget': {
-        const k = String(m.code || '').toUpperCase().replace(/[^A-Z0-9]/g, ''), x = xfers.get(k);
-        if (!x || now - x.at > XFER_TTL_MS) { xfers.delete(k); send(ws, { t: 'xget', id: m.id, error: 'not found' }); break; }
-        xfers.delete(k); send(ws, { t: 'xget', id: m.id, data: x.data });
+        xferGet(m.code).then(data => send(ws, data ? { t: 'xget', id: m.id, data } : { t: 'xget', id: m.id, error: 'not found' }), () => send(ws, { t: 'xget', id: m.id, error: 'server' }));
         break;
       }
       case 'create': {
