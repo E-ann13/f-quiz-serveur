@@ -138,7 +138,7 @@ async function lbAuth(pid, pkey) {
 }
 async function lbPut(m) {
   if (!(await lbAuth(m.pid, m.pkey))) return { error: 'auth' };
-  const meta = JSON.stringify({ n: cleanName(m.name), av: String(m.av || '').slice(0, 40), ban: String(m.ban || '').slice(0, 24), g: String(m.grade || '').slice(0, 40), c: cleanClub(m.club) });
+  const meta = JSON.stringify({ n: cleanName(m.name), av: String(m.av || '').slice(0, 40), ban: String(m.ban || '').slice(0, 24), g: String(m.grade || '').slice(0, 40), c: cleanClub(m.club), at: Date.now() });
   const cmds = [['SET', 'lbp:' + m.pid, meta]];
   (Array.isArray(m.entries) ? m.entries : []).slice(0, 5).forEach(e => {
     const B = LB[e && e.b]; if (!B) return; const s = Math.round(+e.s);
@@ -169,6 +169,10 @@ async function clubUpdate(pid, clubName, xp, cmds) {
 }
 async function lbDel(m) {
   if (!(await lbAuth(m.pid, m.pkey))) return { error: 'auth' };
+  return lbWipe(m.pid);
+}
+async function lbWipe(pid) {
+  const m = { pid };
   const now = Date.now(), days = [-1, 0, 1].map(k => { const d = new Date(now + k * 864e5); return d.getUTCFullYear() + '-' + (d.getUTCMonth() + 1) + '-' + d.getUTCDate(); });
   const cmds = [['ZREM', 'lb:xp', m.pid], ['ZREM', 'lb:wxp:' + weekKey(), m.pid], ['ZREM', 'lb:wxp:' + weekKey(now - 7 * 864e5), m.pid]]
     .concat(days.map(d => ['ZREM', 'lb:day:' + d, m.pid]), [['DEL', 'lbp:' + m.pid, 'lbk:' + m.pid]]);
@@ -283,7 +287,95 @@ async function suggList(m) {
   const ex = await dbMany(ks.map(([k]) => ['GET', 'sgn:' + k]).concat(okId(m.pid) ? ks.map(([k]) => ['SISMEMBER', 'sgv:' + k, m.pid]) : []));
   return { list: ks.map(([k, v], i) => ({ k, n: ex[i] || k, v, me: okId(m.pid) ? +ex[ks.length + i] === 1 : false })) };
 }
-const DATA_OPS = { clubm: clubMembers, clubq: clubSearch, sugg: suggAdd, sggl: suggList, lbput: lbPut, lbget: lbGet, lbdel: lbDel, cdel: cloudDel, cnew: cloudNew, cput: cloudPut, cget: cloudGet, clink: cloudLink, cjoin: cloudJoin };
+
+// ---------- Ligues entre amis : une épreuve par jour pendant N jours, mêmes questions pour tous, un seul essai ----------
+// lg:<code> (réglages), lgm:<code> (membres, zset date d'arrivée), lgp:<code>:<pid> (nom/avatar), lgd:<code>:<jour>:<pid> (score du jour, écrit une fois)
+const LG_MAX_MEM = 40;
+const parisDay = t => { const d = new Date((t || Date.now()) + 3600e3); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()); };
+const dayUTC = s => { if (!DAY_RE.test(s || '')) return NaN; const [y, m, j] = s.split('-').map(Number); return Date.UTC(y, m - 1, j); };
+function lgCfg(c) {
+  c = c && typeof c === 'object' ? c : {};
+  const int = (v, a, b, d) => { v = Math.round(+v); return v >= a && v <= b ? v : d; };
+  const strs = (a, n) => (Array.isArray(a) ? a : []).map(x => String(x).replace(/[^a-z0-9_-]/gi, '').slice(0, 20)).filter(Boolean).slice(0, n);
+  return { n: int(c.n, 5, 20, 10), tech: int(c.tech, 0, 20, 3), fams: strs(c.fams, 8), lvl: int(c.lvl, 1, 3, 3), cats: strs(c.cats, 12), fame: !!c.fame,
+    q: ['photo', 'sil', 'name', 'mix'].includes(c.q) ? c.q : 'mix', t: int(c.t, 8, 60, 20), nopt: int(c.nopt, 3, 6, 4),
+    era: ['all', 'pion', 'edg', 'ww2', 'froide', 'mod'].includes(c.era) ? c.era : 'all', nat: ['all', 'fr', 'us', 'uk', 'de', 'urss', 'it', 'jp'].includes(c.nat) ? c.nat : 'all', speed: c.speed !== false };
+}
+async function lgLoad(code) {
+  if (!/^[A-Z2-9]{6}$/.test(code || '')) return null;
+  const raw = await db(['GET', 'lg:' + code]); if (!raw) return null;
+  try { return JSON.parse(raw); } catch (e) { return null; }
+}
+async function lgNew(m) {
+  if (!(await lbAuth(m.pid, m.pkey))) return { error: 'auth' };
+  const days = [3, 5, 7, 10, 14].includes(+m.days) ? +m.days : 7;
+  const t0 = dayUTC(m.start); if (!(Math.abs(t0 - parisDay()) <= 8 * 864e5)) return { error: 'start' };
+  const name = String(m.lname || '').replace(/[\u0000-\u001f<>]/g, '').replace(/\s+/g, ' ').trim().slice(0, 32);
+  const lg = { name: name && !rude(name) ? name : 'Ligue F-QUIZ', host: m.pid, start: m.start, days, cfg: lgCfg(m.cfg), at: Date.now() };
+  const ttl = Math.round((t0 - Date.now()) / 1000) + (days + 30) * 86400;
+  for (let n = 0; n < 30; n++) {
+    let code = ''; for (let i = 0; i < 6; i++) code += CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)];
+    if ((await db(['SET', 'lg:' + code, JSON.stringify(lg), 'NX', 'EX', ttl])) === 'OK') {
+      await lgJoin(Object.assign({}, m, { code }));
+      return { code, lg };
+    }
+  }
+  return { error: 'server' };
+}
+async function lgJoin(m) {
+  if (!(await lbAuth(m.pid, m.pkey))) return { error: 'auth' };
+  const lg = await lgLoad(m.code); if (!lg) return { error: 'gone' };
+  const ttl = Math.max(3600, Math.round((dayUTC(lg.start) - Date.now()) / 1000) + (lg.days + 30) * 86400);
+  const already = await db(['ZSCORE', 'lgm:' + m.code, m.pid]);
+  if (already === null || already === undefined) { if ((+(await db(['ZCARD', 'lgm:' + m.code])) || 0) >= LG_MAX_MEM) return { error: 'full' }; }
+  const meta = JSON.stringify({ n: cleanName(m.name), av: String(m.av || '').slice(0, 40), ban: String(m.ban || '').slice(0, 24) });
+  await dbMany([['ZADD', 'lgm:' + m.code, already === null || already === undefined ? Date.now() : +already, m.pid], ['EXPIRE', 'lgm:' + m.code, ttl], ['SET', 'lgp:' + m.code + ':' + m.pid, meta, 'EX', ttl]]);
+  return lgGet(m);
+}
+async function lgGet(m) {
+  const lg = await lgLoad(m.code); if (!lg) return { error: 'gone' };
+  const flat = (await db(['ZRANGE', 'lgm:' + m.code, 0, LG_MAX_MEM - 1, 'WITHSCORES'])) || [];
+  const ids = []; for (let i = 0; i < flat.length; i += 2) ids.push(flat[i]);
+  const keys = [];
+  ids.forEach(id => { keys.push('lgp:' + m.code + ':' + id); for (let d = 0; d < lg.days; d++) keys.push('lgd:' + m.code + ':' + d + ':' + id); });
+  const vals = keys.length ? await db(['MGET'].concat(keys)) : [];
+  const per = lg.days + 1;
+  const members = ids.map((id, i) => {
+    let mt = {}; try { mt = JSON.parse(vals[i * per] || '{}') || {}; } catch (e) {}
+    const sc = []; for (let d = 0; d < lg.days; d++) { let x = null; try { x = vals[i * per + 1 + d] ? JSON.parse(vals[i * per + 1 + d]) : null; } catch (e) {} sc.push(x); }
+    return { n: mt.n || 'Pilote', av: mt.av || '', ban: mt.ban || '', sc, me: id === m.pid, host: id === lg.host };
+  });
+  const today = Math.floor((parisDay() - dayUTC(lg.start)) / 864e5);
+  return { code: m.code, lg: Object.assign({}, lg, { host: undefined }), members, today, isHost: lg.host === m.pid, isMember: ids.includes(m.pid) };
+}
+async function lgPut(m) {
+  if (!(await lbAuth(m.pid, m.pkey))) return { error: 'auth' };
+  const lg = await lgLoad(m.code); if (!lg) return { error: 'gone' };
+  const d = Math.round(+m.d); if (!(d >= 0 && d < lg.days)) return { error: 'day' };
+  // le jour joué doit être aujourd'hui (heure de Paris, avec une marge pour les autres fuseaux)
+  const dt = dayUTC(lg.start) + d * 864e5; if (Math.abs(dt - parisDay()) > 864e5) return { error: 'day' };
+  const sc = await db(['ZSCORE', 'lgm:' + m.code, m.pid]); if (sc === null || sc === undefined) return { error: 'member' };
+  const nq = lg.cfg.n, ok = Math.max(0, Math.min(nq, Math.round(+m.ok) || 0)), p = Math.max(0, Math.min(nq * 150, Math.round(+m.p) || 0));
+  const ttl = Math.max(3600, Math.round((dayUTC(lg.start) - Date.now()) / 1000) + (lg.days + 30) * 86400);
+  const r = await db(['SET', 'lgd:' + m.code + ':' + d + ':' + m.pid, JSON.stringify({ p, ok, nq, at: Date.now() }), 'NX', 'EX', ttl]);
+  const out = await lgGet(m); out.dup = r !== 'OK'; return out;
+}
+async function lgLeave(m) {
+  if (!(await lbAuth(m.pid, m.pkey))) return { error: 'auth' };
+  await db(['ZREM', 'lgm:' + m.code, m.pid]); return { ok: true };
+}
+
+// ---------- Administration du classement (clé ADMIN_KEY dans les variables d'environnement de Render) ----------
+const ADMIN_KEY = process.env.ADMIN_KEY || '';
+async function lbAdmin(m) {
+  if (!ADMIN_KEY || typeof m.key !== 'string' || sha(m.key) !== sha(ADMIN_KEY)) return { error: 'auth' };
+  if (m.act === 'del') { if (!okId(m.pid)) return { error: 'bad' }; await lbWipe(m.pid); return { ok: true }; }
+  const flat = (await db(['ZRANGE', 'lb:xp', 0, 299, 'REV', 'WITHSCORES'])) || [], ids = [];
+  for (let i = 0; i < flat.length; i += 2) ids.push([flat[i], +flat[i + 1]]);
+  const metas = ids.length ? await db(['MGET'].concat(ids.map(x => 'lbp:' + x[0]))) : [];
+  return { list: ids.map(([pid, xp], i) => { let mt = {}; try { mt = JSON.parse(metas[i] || '{}') || {}; } catch (e) {} return { pid, xp, n: mt.n || 'Pilote', av: mt.av || '', g: mt.g || '', c: mt.c || '', at: mt.at || 0 }; }) };
+}
+const DATA_OPS = { lbadm: lbAdmin, lgnew: lgNew, lgjoin: lgJoin, lgget: lgGet, lgput: lgPut, lgleave: lgLeave, clubm: clubMembers, clubq: clubSearch, sugg: suggAdd, sggl: suggList, lbput: lbPut, lbget: lbGet, lbdel: lbDel, cdel: cloudDel, cnew: cloudNew, cput: cloudPut, cget: cloudGet, clink: cloudLink, cjoin: cloudJoin };
 
 const createdBy = new Map(); // identifiant de création -> code (évite les salons en double après une coupure)
 const rooms = new Map(); // code -> {code, created, touched, players: [{id, token, name, ws, seat, leftAt}], log: []}
