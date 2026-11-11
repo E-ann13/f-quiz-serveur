@@ -4,6 +4,7 @@
 //
 // Démarrage : node server.js   (port : variable PORT, 8787 par défaut)
 // Santé : GET /health → {"ok":true,...,"db":"upstash"|"memoire"}
+// v1.8 : fiche joueur des classements (statistiques publiques envoyées avec lbput, renvoyées par lbget)
 // v1.7 : page « Mon aéroclub » (clubm : membres du club)
 // v1.6 : recherche d'aéroclub (clubq) ; création de salon idempotente (plus de salon en double quand le serveur se réveille)
 // v1.5 : ligue des aéroclubs (lb club) et suggestions d'avions (sugg/sggl)
@@ -137,9 +138,16 @@ async function lbAuth(pid, pkey) {
   if (set === 'OK') return true;
   return (await db(['GET', 'lbk:' + pid])) === h;
 }
+// statistiques publiques de la fiche joueur : uniquement des nombres entiers bornés, clés connues
+const STAT_KEYS = ['w', 'p', 'd', 'bs', 'b', 'm', 'bg'];
+function cleanStats(x) {
+  if (!x || typeof x !== 'object') return undefined;
+  const o = {}; STAT_KEYS.forEach(k => { const v = Math.round(+x[k]); if (Number.isFinite(v) && v >= 0 && v <= 1e6) o[k] = v; });
+  return Object.keys(o).length ? o : undefined;
+}
 async function lbPut(m) {
   if (!(await lbAuth(m.pid, m.pkey))) return { error: 'auth' };
-  const meta = JSON.stringify({ n: cleanName(m.name), av: String(m.av || '').slice(0, 40), ban: String(m.ban || '').slice(0, 24), g: String(m.grade || '').slice(0, 40), c: cleanClub(m.club), at: Date.now() });
+  const meta = JSON.stringify({ n: cleanName(m.name), av: String(m.av || '').slice(0, 40), ban: String(m.ban || '').slice(0, 24), g: String(m.grade || '').slice(0, 40), c: cleanClub(m.club), x: cleanStats(m.stats), at: Date.now() });
   const cmds = [['SET', 'lbp:' + m.pid, meta]];
   (Array.isArray(m.entries) ? m.entries : []).slice(0, 5).forEach(e => {
     const B = LB[e && e.b]; if (!B) return; const s = Math.round(+e.s);
@@ -220,7 +228,7 @@ async function lbGet(m) {
   const res = await dbMany([['ZRANGE', k, 0, 49].concat(B.high ? ['REV'] : [], ['WITHSCORES']), ['ZCARD', k]].concat(okId(m.pid) ? [[B.high ? 'ZREVRANK' : 'ZRANK', k, m.pid], ['ZSCORE', k, m.pid]] : []));
   const flat = res[0] || [], ids = []; for (let i = 0; i < flat.length; i += 2) ids.push([flat[i], +flat[i + 1]]);
   const metas = ids.length ? await db(['MGET'].concat(ids.map(x => 'lbp:' + x[0]))) : [];
-  const top = ids.map(([id, s], i) => { let mt = {}; try { mt = JSON.parse(metas[i] || '{}') || {}; } catch (e) {} return { n: mt.n || 'Pilote', av: mt.av || '', ban: mt.ban || '', g: mt.g || '', c: mt.c || '', s, me: id === m.pid }; });
+  const top = ids.map(([id, s], i) => { let mt = {}; try { mt = JSON.parse(metas[i] || '{}') || {}; } catch (e) {} return { n: mt.n || 'Pilote', av: mt.av || '', ban: mt.ban || '', g: mt.g || '', c: mt.c || '', x: mt.x || null, at: mt.at || 0, s, me: id === m.pid }; });
   const me = okId(m.pid) && res[2] !== null && res[2] !== undefined ? { rank: +res[2] + 1, s: +res[3] } : null;
   return { top, total: +res[1] || 0, me, week: m.b === 'wxp' ? weekKey() : undefined };
 }
@@ -453,7 +461,7 @@ const server = http.createServer((req, res) => {
   }
   if (req.url === '/health') {
     res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
-    res.end(JSON.stringify({ ok: true, rooms: rooms.size, uptime: Math.round(process.uptime()), db: DB_ON ? 'upstash' : 'memoire' }));
+    res.end(JSON.stringify({ ok: true, v: '1.8', rooms: rooms.size, uptime: Math.round(process.uptime()), db: DB_ON ? 'upstash' : 'memoire' }));
     return;
   }
   res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
