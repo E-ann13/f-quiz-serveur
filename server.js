@@ -4,6 +4,7 @@
 //
 // Démarrage : node server.js   (port : variable PORT, 8787 par défaut)
 // Santé : GET /health → {"ok":true,...,"db":"upstash"|"memoire"}
+// v1.9 : statistiques anonymes d'utilisation (stat) et page /stats?k=CLÉ_ADMIN
 // v1.8 : fiche joueur des classements (statistiques publiques envoyées avec lbput, renvoyées par lbget)
 // v1.7 : page « Mon aéroclub » (clubm : membres du club)
 // v1.6 : recherche d'aéroclub (clubq) ; création de salon idempotente (plus de salon en double quand le serveur se réveille)
@@ -78,6 +79,10 @@ function memCmd(c) {
       if (old === undefined || !mode || (mode === 'GT' && sc > old) || (mode === 'LT' && sc < old)) z.set(m, sc);
       return 1;
     }
+    case 'HINCRBY': { const h = mem.kv.get(k) instanceof Map ? mem.kv.get(k) : new Map(); mem.kv.set(k, h); const v = (h.get(String(c[2])) || 0) + (+c[3]); h.set(String(c[2]), v); return v; }
+    case 'HGETALL': { const h = mem.kv.get(k); if (!(h instanceof Map)) return []; const out = []; h.forEach((v, f) => out.push(f, String(v))); return out; }
+    case 'PFADD': { const set = mem.kv.get(k) instanceof Set ? mem.kv.get(k) : new Set(); mem.kv.set(k, set); const n0 = set.size; c.slice(2).forEach(x => set.add(String(x))); return set.size > n0 ? 1 : 0; }
+    case 'PFCOUNT': { const u = new Set(); c.slice(1).forEach(x => { const set = mem.kv.get(x); if (set instanceof Set) set.forEach(y => u.add(y)); }); return u.size; }
     case 'ZSCORE': { const z = mem.z.get(k); const v = z && z.get(String(c[2])); return v === undefined ? null : String(v); }
     case 'ZCOUNT': { const z = mem.z.get(k); if (!z) return 0; const lo = c[2] === '-inf' ? -Infinity : +c[2], hi = c[3] === '+inf' ? Infinity : +c[3]; return [...z.values()].filter(v => v >= lo && v <= hi).length; }
     case 'ZCARD': { const z = mem.z.get(k); return z ? z.size : 0; }
@@ -401,7 +406,66 @@ async function xferGet(k) {
   x.at = Math.min(x.at, Date.now() - XFER_TTL_MS + XFER_GRACE_S * 1000);
   return x.data;
 }
-const DATA_OPS = { lbadm: lbAdmin, lgnew: lgNew, lgjoin: lgJoin, lgget: lgGet, lgput: lgPut, lgleave: lgLeave, clubm: clubMembers, clubq: clubSearch, sugg: suggAdd, sggl: suggList, lbput: lbPut, lbget: lbGet, lbdel: lbDel, cdel: cloudDel, cnew: cloudNew, cput: cloudPut, cget: cloudGet, clink: cloudLink, cjoin: cloudJoin };
+// ---------- Statistiques anonymes d'utilisation (aucun nom, aucun compte : un identifiant d'appareil tiré au hasard) ----------
+const ST_TTL = 400 * 86400;
+const okMode = s => typeof s === 'string' && /^[a-z-]{2,20}$/.test(s);
+const okDay = s => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
+const isoWeek = d => { const t = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())); const n = t.getUTCDay() || 7; t.setUTCDate(t.getUTCDate() + 4 - n); const y = new Date(Date.UTC(t.getUTCFullYear(), 0, 1)); return t.getUTCFullYear() + '-S' + String(Math.ceil(((t - y) / 86400000 + 1) / 7)).padStart(2, '0'); };
+async function statPut(m) {
+  if (!okId(m.sid) || !okDay(m.d)) return { error: 'bad' };
+  const dd = new Date(m.d + 'T12:00:00Z'), age = (Date.now() - dd) / 86400000; if (!(age > -2 && age < 15)) return { ok: true };
+  const H = 'st:d:' + m.d, cmds = [], num = x => Math.max(0, Math.min(200, Math.floor(+x || 0)));
+  const open = num(m.open);
+  if (open) { cmds.push(['HINCRBY', H, 'open', open], ['PFADD', 'st:u:' + m.d, m.sid], ['PFADD', 'st:w:' + isoWeek(dd), m.sid], ['PFADD', 'st:u:all', m.sid]); }
+  if (m.nw) cmds.push(['HINCRBY', H, 'new', 1]);
+  for (const f of ['s', 'e']) { const o = m[f] && typeof m[f] === 'object' ? m[f] : {}; Object.keys(o).slice(0, 30).forEach(k => { if (okMode(k) && num(o[k])) cmds.push(['HINCRBY', H, f + ':' + k, num(o[k])]); }); }
+  if (open) {
+    if (typeof m.v === 'string' && /^[A-Za-z0-9.-]{1,20}$/.test(m.v)) cmds.push(['HINCRBY', 'st:v:' + m.d, m.v, 1]);
+    if (okMode(m.dev)) cmds.push(['HINCRBY', 'st:dev:' + m.d, m.dev, 1]);
+    cmds.push(['HINCRBY', H, m.app ? 'app' : 'nav', 1]);
+    if (m.lang === 'en') cmds.push(['HINCRBY', H, 'en', 1]);
+  }
+  if (!cmds.length) return { ok: true };
+  ['st:d:', 'st:u:', 'st:v:', 'st:dev:'].forEach(p => cmds.push(['EXPIRE', p + m.d, ST_TTL]));
+  cmds.push(['EXPIRE', 'st:w:' + isoWeek(dd), ST_TTL]);
+  await dbMany(cmds);
+  return { ok: true };
+}
+const hObj = a => { const o = {}; for (let i = 0; a && i < a.length; i += 2) o[a[i]] = +a[i + 1]; return o; };
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const MODE_FR = { 'radar-ia': 'Contact radar (IA)', 'radar-local': 'Contact radar (même téléphone)', 'radar-online': 'Contact radar (en ligne)', relay: 'Relais', daily: 'Avion du jour', free: 'Avion mystère libre', arpt: 'Approche finale', visual: 'Reconnaissance visuelle', 'visual-online': 'Visuel en ligne', squawk: 'Squawk', exam: 'Examen', gp: 'Grand Prix', 'tourn-online': 'Tournoi en ligne', club: 'Soirée club', league: 'Ligue', engines: 'Motoriste' };
+async function statPage(days) {
+  const D = []; for (let i = 0; i < days; i++) { const d = new Date(Date.now() - i * 86400000); D.push(d.toISOString().slice(0, 10)); }
+  const cmds = [];
+  D.forEach(d => cmds.push(['HGETALL', 'st:d:' + d], ['PFCOUNT', 'st:u:' + d], ['HGETALL', 'st:dev:' + d], ['HGETALL', 'st:v:' + d]));
+  const W = []; for (let i = 0; i < 8; i++) W.push(isoWeek(new Date(Date.now() - i * 7 * 86400000)));
+  W.forEach(w => cmds.push(['PFCOUNT', 'st:w:' + w]));
+  cmds.push(['PFCOUNT', 'st:u:all']);
+  const R = await dbMany(cmds);
+  const rows = D.map((d, i) => ({ d, h: hObj(R[i * 4]), u: +R[i * 4 + 1] || 0, dev: hObj(R[i * 4 + 2]), v: hObj(R[i * 4 + 3]) }));
+  const wk = W.map((w, i) => ({ w, u: +R[D.length * 4 + i] || 0 })), all = +R[R.length - 1] || 0;
+  const tot = {}, devT = {}, verT = {};
+  rows.forEach(r => { Object.entries(r.h).forEach(([k, v]) => tot[k] = (tot[k] || 0) + v); Object.entries(r.dev).forEach(([k, v]) => devT[k] = (devT[k] || 0) + v); });
+  (rows[0] ? Object.entries(rows[0].v).concat(rows[1] ? Object.entries(rows[1].v) : []) : []).forEach(([k, v]) => verT[k] = (verT[k] || 0) + v);
+  const modes = Object.keys(tot).filter(k => k.startsWith('s:')).map(k => k.slice(2)).sort((a, b) => (tot['s:' + b] || 0) - (tot['s:' + a] || 0));
+  const maxU = Math.max(1, ...rows.map(r => r.u)), maxM = Math.max(1, ...modes.map(m => tot['s:' + m] || 0));
+  const bar = (v, mx, c) => `<i style="display:inline-block;height:10px;border-radius:5px;background:${c};width:${Math.max(2, v / mx * 100)}%"></i>`;
+  const u7 = rows.slice(0, 7).reduce((a, r) => a + r.u, 0), n30 = tot.new || 0;
+  return `<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>F-QUIZ · statistiques</title>
+<style>body{margin:0;background:#0b1220;color:#e6ecf3;font:15px/1.45 system-ui,sans-serif;padding:18px;max-width:900px;margin:auto}h1{font-size:22px;margin:0 0 4px}h2{font-size:15px;letter-spacing:.06em;text-transform:uppercase;color:#f2c14e;margin:26px 0 8px}
+.k{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}.k div{background:#141e33;border-radius:14px;padding:12px 14px}.k b{display:block;font-size:26px}.k small{color:#9aa7b8}
+table{width:100%;border-collapse:collapse;font-size:13.5px}td,th{padding:6px 8px;border-bottom:1px solid #1e2a42;text-align:left;vertical-align:middle}th{color:#9aa7b8;font-weight:600}td.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}td.b{width:40%}p.s{color:#6b7a8e;font-size:12.5px}</style></head><body>
+<h1>📊 F-QUIZ · statistiques anonymes</h1><p class="s">${days} derniers jours · mis à jour ${esc(new Date().toLocaleString('fr-FR', { timeZone: 'Europe/Paris' }))}</p>
+<div class="k"><div><b>${rows[0] ? rows[0].u : 0}</b><small>joueurs aujourd’hui</small></div><div><b>${wk[0].u}</b><small>joueurs cette semaine</small></div><div><b>${n30}</b><small>nouveaux joueurs (${days} j)</small></div><div><b>${all}</b><small>joueurs depuis le début</small></div><div><b>${tot.open || 0}</b><small>ouvertures du jeu (${days} j)</small></div><div><b>${tot.app || 0}</b><small>ouvertures en appli installée</small></div></div>
+<h2>Modes joués (${days} j)</h2><table><tr><th>Mode</th><th></th><th>Lancées</th><th>Finies</th><th>Abandon</th></tr>${modes.map(m => { const s = tot['s:' + m] || 0, e = Math.min(s, tot['e:' + m] || 0); return `<tr><td>${esc(MODE_FR[m] || m)}</td><td class="b">${bar(s, maxM, '#f2c14e')}</td><td class="n">${s}</td><td class="n">${e}</td><td class="n">${s ? Math.round((1 - e / s) * 100) + ' %' : '—'}</td></tr>`; }).join('') || '<tr><td colspan="5">Pas encore de données.</td></tr>'}</table>
+<h2>Joueurs par jour</h2><table><tr><th>Jour</th><th></th><th>Joueurs</th><th>Nouveaux</th><th>Ouvertures</th></tr>${rows.map(r => `<tr><td>${r.d.slice(8)}/${r.d.slice(5, 7)}</td><td class="b">${bar(r.u, maxU, '#5fd38d')}</td><td class="n">${r.u}</td><td class="n">${r.h.new || 0}</td><td class="n">${r.h.open || 0}</td></tr>`).join('')}</table>
+<h2>Joueurs par semaine</h2><table>${wk.map(x => `<tr><td>${esc(x.w)}</td><td class="n">${x.u}</td></tr>`).join('')}</table>
+<h2>Appareils (${days} j)</h2><table>${Object.entries(devT).sort((a, b) => b[1] - a[1]).map(([k, v]) => `<tr><td>${esc(k)}</td><td class="n">${v}</td></tr>`).join('')}</table>
+<h2>Versions (aujourd’hui et hier)</h2><table>${Object.entries(verT).sort((a, b) => b[1] - a[1]).map(([k, v]) => `<tr><td>${esc(k)}</td><td class="n">${v}</td></tr>`).join('')}</table>
+<p class="s">« Joueurs » = appareils différents (comptage approché). « Abandon » = parties lancées puis quittées avant la fin.</p></body></html>`;
+}
+
+const DATA_OPS = { stat: statPut, lbadm: lbAdmin, lgnew: lgNew, lgjoin: lgJoin, lgget: lgGet, lgput: lgPut, lgleave: lgLeave, clubm: clubMembers, clubq: clubSearch, sugg: suggAdd, sggl: suggList, lbput: lbPut, lbget: lbGet, lbdel: lbDel, cdel: cloudDel, cnew: cloudNew, cput: cloudPut, cget: cloudGet, clink: cloudLink, cjoin: cloudJoin };
 
 const createdBy = new Map(); // identifiant de création -> code (évite les salons en double après une coupure)
 const rooms = new Map(); // code -> {code, created, touched, players: [{id, token, name, ws, seat, leftAt}], log: []}
@@ -459,9 +523,17 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({ rooms: roomList() }));
     return;
   }
+  const sm = req.url.match(/^\/stats\?k=([^&]+)(?:&j=(\d+))?$/);
+  if (sm && req.method === 'GET') {
+    let key = ''; try { key = decodeURIComponent(sm[1]); } catch (e) {}
+    if (!ADMIN_KEY || sha(key) !== sha(ADMIN_KEY)) { res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' }); res.end('Clé incorrecte.'); return; }
+    statPage(Math.min(90, Math.max(7, +sm[2] || 30))).then(h => { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }); res.end(h); },
+      e => { console.error('stats', e.message); res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8' }); res.end('Base indisponible.'); });
+    return;
+  }
   if (req.url === '/health') {
     res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
-    res.end(JSON.stringify({ ok: true, v: '1.8', rooms: rooms.size, uptime: Math.round(process.uptime()), db: DB_ON ? 'upstash' : 'memoire' }));
+    res.end(JSON.stringify({ ok: true, v: '1.9', rooms: rooms.size, uptime: Math.round(process.uptime()), db: DB_ON ? 'upstash' : 'memoire' }));
     return;
   }
   res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
