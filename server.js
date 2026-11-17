@@ -5,6 +5,8 @@
 // Démarrage : node server.js   (port : variable PORT, 8787 par défaut)
 // Santé : GET /health → {"ok":true,...,"db":"upstash"|"memoire"}
 // v1.9 : statistiques anonymes d'utilisation (stat) et page /stats?k=CLÉ_ADMIN
+// v1.10 : signalements des joueurs (rep) et page /reports?k=CLÉ_ADMIN
+// v1.11 : invitations dans le jeu (invsend / invget) : une invitation vers un salon, gardée 15 min pour le joueur invité
 // v1.8 : fiche joueur des classements (statistiques publiques envoyées avec lbput, renvoyées par lbget)
 // v1.7 : page « Mon aéroclub » (clubm : membres du club)
 // v1.6 : recherche d'aéroclub (clubq) ; création de salon idempotente (plus de salon en double quand le serveur se réveille)
@@ -85,6 +87,10 @@ function memCmd(c) {
     case 'PFCOUNT': { const u = new Set(); c.slice(1).forEach(x => { const set = mem.kv.get(x); if (set instanceof Set) set.forEach(y => u.add(y)); }); return u.size; }
     case 'ZSCORE': { const z = mem.z.get(k); const v = z && z.get(String(c[2])); return v === undefined ? null : String(v); }
     case 'ZCOUNT': { const z = mem.z.get(k); if (!z) return 0; const lo = c[2] === '-inf' ? -Infinity : +c[2], hi = c[3] === '+inf' ? Infinity : +c[3]; return [...z.values()].filter(v => v >= lo && v <= hi).length; }
+    case 'LPUSH': { const l = Array.isArray(mem.kv.get(k)) ? mem.kv.get(k) : []; mem.kv.set(k, l); c.slice(2).forEach(x => l.unshift(String(x))); return l.length; }
+    case 'LTRIM': { const l = mem.kv.get(k); if (Array.isArray(l)) mem.kv.set(k, l.slice(+c[2], +c[3] + 1)); return 'OK'; }
+    case 'LRANGE': { const l = mem.kv.get(k); return Array.isArray(l) ? l.slice(+c[2], +c[3] < 0 ? undefined : +c[3] + 1) : []; }
+    case 'LREM': { const l = mem.kv.get(k); if (!Array.isArray(l)) return 0; const n0 = l.length; mem.kv.set(k, l.filter(x => x !== String(c[3]))); return n0 - mem.kv.get(k).length; }
     case 'ZCARD': { const z = mem.z.get(k); return z ? z.size : 0; }
     case 'ZRANGE': {
       // ZRANGE key start stop [REV] WITHSCORES
@@ -431,6 +437,28 @@ async function statPut(m) {
   await dbMany(cmds);
   return { ok: true };
 }
+// ---------- Signalements des joueurs : avion, question, aéroport ou autre ----------
+// rep:list (les 1000 derniers, JSON), rl:rep:<sid> (20 par heure et par appareil)
+const REP_KIND = ['plane', 'question', 'airport', 'other'];
+async function repPut(m) {
+  if (!okId(m.sid)) return { error: 'bad' };
+  const n = await db(['INCR', 'rl:rep:' + m.sid]); if (+n === 1) await db(['EXPIRE', 'rl:rep:' + m.sid, 3600]);
+  if (+n > 20) return { error: 'rate' };
+  const cl = (x, l) => String(x || '').replace(/[\u0000-\u0008\u000b-\u001f]/g, '').slice(0, l);
+  const r = { t: Date.now(), k: REP_KIND.includes(m.kind) ? m.kind : 'other', ref: cl(m.ref, 80), lab: cl(m.label, 200), ty: cl(m.type, 60), msg: cl(m.msg, 1200), ctx: cl(m.ctx, 80), v: cl(m.v, 30), dev: cl(m.dev, 400), sid: m.sid.slice(0, 8) };
+  if (!r.ty && !r.msg) return { error: 'bad' };
+  await dbMany([['LPUSH', 'rep:list', JSON.stringify(r)], ['LTRIM', 'rep:list', 0, 999]]);
+  return { ok: true };
+}
+async function repPage() {
+  const L = (await db(['LRANGE', 'rep:list', 0, 499]) || []).map(x => { try { return JSON.parse(x); } catch (e) { return null; } }).filter(Boolean);
+  const KF = { plane: 'Avion', question: 'Question', airport: 'Aéroport', other: 'Autre' };
+  const cnt = {}; L.forEach(r => { const k = r.k + '|' + (r.ref || r.lab); cnt[k] = (cnt[k] || 0) + 1; });
+  const row = r => `<tr><td>${new Date(r.t).toLocaleString('fr-FR', { timeZone: 'Europe/Paris', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}</td><td><b>${KF[r.k] || r.k}</b>${cnt[r.k + '|' + (r.ref || r.lab)] > 1 ? ` <i>×${cnt[r.k + '|' + (r.ref || r.lab)]}</i>` : ''}</td><td>${esc(r.lab || r.ref)}${r.ref && r.lab ? `<small>${esc(r.ref)}</small>` : ''}</td><td><b>${esc(r.ty)}</b><br>${esc(r.msg).replace(/\n/g, '<br>')}</td><td><small>${esc(r.ctx)} · ${esc(r.v)}<br>${esc(r.dev).slice(0, 140)}</small></td></tr>`;
+  return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>F-QUIZ · Signalements</title>
+<style>body{margin:0;background:#0f1520;color:#d6dde8;font:14px/1.45 system-ui,sans-serif;padding:18px}h1{color:#F2C14E;font-size:22px;margin:0 0 4px}p{color:#9AA7B8;margin:0 0 14px}table{width:100%;border-collapse:collapse}td{border-top:1px solid #2a3446;padding:8px 6px;vertical-align:top}td:first-child{white-space:nowrap;color:#9AA7B8}small{display:block;color:#7F8B9C}i{color:#F2C14E;font-style:normal}b{color:#fff}</style>
+<h1>Signalements des joueurs</h1><p>${L.length} signalement(s), les plus récents en haut. ×N : signalé plusieurs fois.</p><table>${L.map(row).join('')}</table>`;
+}
 const hObj = a => { const o = {}; for (let i = 0; a && i < a.length; i += 2) o[a[i]] = +a[i + 1]; return o; };
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const MODE_FR = { 'radar-ia': 'Contact radar (IA)', 'radar-local': 'Contact radar (même téléphone)', 'radar-online': 'Contact radar (en ligne)', relay: 'Relais', daily: 'Avion du jour', free: 'Avion mystère libre', arpt: 'Approche finale', visual: 'Reconnaissance visuelle', 'visual-online': 'Visuel en ligne', squawk: 'Squawk', exam: 'Examen', gp: 'Grand Prix', 'tourn-online': 'Tournoi en ligne', club: 'Soirée club', league: 'Ligue', engines: 'Motoriste' };
@@ -465,7 +493,30 @@ table{width:100%;border-collapse:collapse;font-size:13.5px}td,th{padding:6px 8px
 <p class="s">« Joueurs » = appareils différents (comptage approché). « Abandon » = parties lancées puis quittées avant la fin.</p></body></html>`;
 }
 
-const DATA_OPS = { stat: statPut, lbadm: lbAdmin, lgnew: lgNew, lgjoin: lgJoin, lgget: lgGet, lgput: lgPut, lgleave: lgLeave, clubm: clubMembers, clubq: clubSearch, sugg: suggAdd, sggl: suggList, lbput: lbPut, lbget: lbGet, lbdel: lbDel, cdel: cloudDel, cnew: cloudNew, cput: cloudPut, cget: cloudGet, clink: cloudLink, cjoin: cloudJoin };
+// ---------- invitations dans le jeu ----------
+const INV_TTL = 900, INV_MAX = 10;
+const cleanTxt = (x, n) => String(x || '').replace(/[\u0000-\u001f<>]/g, '').replace(/\s+/g, ' ').trim().slice(0, n);
+async function invSend(m) {
+  if (!(await lbAuth(m.pid, m.pkey))) return { error: 'auth' };
+  const code = String(m.code || '').toUpperCase();
+  if (!/^[A-Z0-9]{4,6}$/.test(code) || !rooms.has(code)) return { error: 'room' };
+  const to = (Array.isArray(m.to) ? m.to : []).filter(okId).filter(x => x !== m.pid).slice(0, 8);
+  if (!to.length) return { error: 'bad' };
+  const n = await db(['INCR', 'invr:' + m.pid]); if (+n === 1) await db(['EXPIRE', 'invr:' + m.pid, 60]);
+  if (+n > 6) return { error: 'busy' };
+  const inv = JSON.stringify({ from: m.pid, n: cleanTxt(m.n, 18) || 'Pilote', av: cleanTxt(m.av, 40), g: cleanTxt(m.g, 40), code, at: Date.now() });
+  await dbMany(to.flatMap(x => [['LPUSH', 'inv:' + x, inv], ['LTRIM', 'inv:' + x, 0, INV_MAX - 1], ['EXPIRE', 'inv:' + x, INV_TTL]]));
+  return { ok: true, n: to.length };
+}
+async function invGet(m) {
+  if (!(await lbAuth(m.pid, m.pkey))) return { error: 'auth' };
+  const L = (await db(['LRANGE', 'inv:' + m.pid, 0, INV_MAX - 1])) || [];
+  if (L.length) await db(['DEL', 'inv:' + m.pid]);
+  const now = Date.now(), list = [];
+  L.forEach(x => { try { const o = JSON.parse(x); if (o && now - o.at < INV_TTL * 1000 && rooms.has(o.code) && !list.some(y => y.code === o.code)) list.push(o); } catch (e) {} });
+  return { list };
+}
+const DATA_OPS = { rep: repPut, stat: statPut, lbadm: lbAdmin, lgnew: lgNew, lgjoin: lgJoin, lgget: lgGet, lgput: lgPut, lgleave: lgLeave, clubm: clubMembers, clubq: clubSearch, sugg: suggAdd, sggl: suggList, lbput: lbPut, lbget: lbGet, lbdel: lbDel, cdel: cloudDel, cnew: cloudNew, cput: cloudPut, cget: cloudGet, clink: cloudLink, cjoin: cloudJoin, invsend: invSend, invget: invGet };
 
 const createdBy = new Map(); // identifiant de création -> code (évite les salons en double après une coupure)
 const rooms = new Map(); // code -> {code, created, touched, players: [{id, token, name, ws, seat, leftAt}], log: []}
@@ -531,9 +582,17 @@ const server = http.createServer((req, res) => {
       e => { console.error('stats', e.message); res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8' }); res.end('Base indisponible.'); });
     return;
   }
+  const rm = req.url.match(/^\/reports\?k=([^&]+)$/);
+  if (rm && req.method === 'GET') {
+    let key = ''; try { key = decodeURIComponent(rm[1]); } catch (e) {}
+    if (!ADMIN_KEY || sha(key) !== sha(ADMIN_KEY)) { res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' }); res.end('Clé incorrecte.'); return; }
+    repPage().then(h => { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }); res.end(h); },
+      e => { console.error('reports', e.message); res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8' }); res.end('Base indisponible.'); });
+    return;
+  }
   if (req.url === '/health') {
     res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
-    res.end(JSON.stringify({ ok: true, v: '1.9', rooms: rooms.size, uptime: Math.round(process.uptime()), db: DB_ON ? 'upstash' : 'memoire' }));
+    res.end(JSON.stringify({ ok: true, v: '1.10', rooms: rooms.size, uptime: Math.round(process.uptime()), db: DB_ON ? 'upstash' : 'memoire' }));
     return;
   }
   res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
