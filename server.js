@@ -6,6 +6,8 @@
 // Santé : GET /health → {"ok":true,...,"db":"upstash"|"memoire"}
 // v1.9 : statistiques anonymes d'utilisation (stat) et page /stats?k=CLÉ_ADMIN
 // v1.10 : signalements des joueurs (rep) et page /reports?k=CLÉ_ADMIN
+// v1.13 : rendre son XP à un joueur qui a perdu sa progression (lbadm act 'gift' depuis le panneau de contrôle, récupérée par le jeu avec giftget)
+// v1.12 : comparaison de l'Examen du jour (dsc : envoie son score et reçoit la répartition du jour ; dsg : répartition seule)
 // v1.11 : invitations dans le jeu (invsend / invget) : une invitation vers un salon, gardée 15 min pour le joueur invité
 // v1.8 : fiche joueur des classements (statistiques publiques envoyées avec lbput, renvoyées par lbget)
 // v1.7 : page « Mon aéroclub » (clubm : membres du club)
@@ -82,6 +84,9 @@ function memCmd(c) {
       return 1;
     }
     case 'HINCRBY': { const h = mem.kv.get(k) instanceof Map ? mem.kv.get(k) : new Map(); mem.kv.set(k, h); const v = (h.get(String(c[2])) || 0) + (+c[3]); h.set(String(c[2]), v); return v; }
+    case 'HSETNX': { const h = mem.kv.get(k) instanceof Map ? mem.kv.get(k) : new Map(); mem.kv.set(k, h); if (h.has(String(c[2]))) return 0; h.set(String(c[2]), String(c[3])); return 1; }
+    case 'HGET': { const h = mem.kv.get(k); return h instanceof Map && h.has(String(c[2])) ? String(h.get(String(c[2]))) : null; }
+    case 'HVALS': { const h = mem.kv.get(k); return h instanceof Map ? [...h.values()].map(String) : []; }
     case 'HGETALL': { const h = mem.kv.get(k); if (!(h instanceof Map)) return []; const out = []; h.forEach((v, f) => out.push(f, String(v))); return out; }
     case 'PFADD': { const set = mem.kv.get(k) instanceof Set ? mem.kv.get(k) : new Set(); mem.kv.set(k, set); const n0 = set.size; c.slice(2).forEach(x => set.add(String(x))); return set.size > n0 ? 1 : 0; }
     case 'PFCOUNT': { const u = new Set(); c.slice(1).forEach(x => { const set = mem.kv.get(x); if (set instanceof Set) set.forEach(y => u.add(y)); }); return u.size; }
@@ -390,10 +395,26 @@ const ADMIN_KEY = process.env.ADMIN_KEY || '';
 async function lbAdmin(m) {
   if (!ADMIN_KEY || typeof m.key !== 'string' || sha(m.key) !== sha(ADMIN_KEY)) return { error: 'auth' };
   if (m.act === 'del') { if (!okId(m.pid)) return { error: 'bad' }; await lbWipe(m.pid); return { ok: true }; }
+  // rendre l'XP d'une ancienne entrée (from) au nouvel appareil du même joueur (to) ; l'ancienne entrée est retirée des classements
+  if (m.act === 'gift') {
+    if (!okId(m.from) || !okId(m.to) || m.from === m.to) return { error: 'bad' };
+    const xp = Math.round(+(await db(['ZSCORE', 'lb:xp', m.from])) || 0); if (!(xp > 0)) return { error: 'empty' };
+    const prev = Math.round(+(await db(['GET', 'lbgift:' + m.to])) || 0);
+    await db(['SET', 'lbgift:' + m.to, String(Math.min(1e7, prev + xp)), 'EX', 90 * 86400]);
+    await lbWipe(m.from);
+    return { ok: true, xp };
+  }
   const flat = (await db(['ZRANGE', 'lb:xp', 0, 299, 'REV', 'WITHSCORES'])) || [], ids = [];
   for (let i = 0; i < flat.length; i += 2) ids.push([flat[i], +flat[i + 1]]);
   const metas = ids.length ? await db(['MGET'].concat(ids.map(x => 'lbp:' + x[0]))) : [];
   return { list: ids.map(([pid, xp], i) => { let mt = {}; try { mt = JSON.parse(metas[i] || '{}') || {}; } catch (e) {} return { pid, xp, n: mt.n || 'Pilote', av: mt.av || '', g: mt.g || '', c: mt.c || '', at: mt.at || 0 }; }) };
+}
+// le jeu vient chercher l'XP qu'on lui a rendue (une seule fois)
+async function giftGet(m) {
+  if (!(await lbAuth(m.pid, m.pkey))) return { error: 'auth' };
+  const v = await db(['GET', 'lbgift:' + m.pid]); if (!v) return { xp: 0 };
+  await db(['DEL', 'lbgift:' + m.pid]);
+  return { xp: Math.max(0, Math.min(1e7, Math.round(+v) || 0)) };
 }
 // ---------- Transfert de progression : dans la base (survit aux redémarrages du serveur), en mémoire en secours ----------
 async function xferPut(data) {
@@ -516,7 +537,30 @@ async function invGet(m) {
   L.forEach(x => { try { const o = JSON.parse(x); if (o && now - o.at < INV_TTL * 1000 && rooms.has(o.code) && !list.some(y => y.code === o.code)) list.push(o); } catch (e) {} });
   return { list };
 }
-const DATA_OPS = { rep: repPut, stat: statPut, lbadm: lbAdmin, lgnew: lgNew, lgjoin: lgJoin, lgget: lgGet, lgput: lgPut, lgleave: lgLeave, clubm: clubMembers, clubq: clubSearch, sugg: suggAdd, sggl: suggList, lbput: lbPut, lbget: lbGet, lbdel: lbDel, cdel: cloudDel, cnew: cloudNew, cput: cloudPut, cget: cloudGet, clink: cloudLink, cjoin: cloudJoin, invsend: invSend, invget: invGet };
+// ---------- comparaison de l'Examen du jour ----------
+// un score par joueur et par jour (le premier envoyé compte), en dixièmes de point (0 à 100) ; gardé 3 jours
+const DSC_KINDS = { exam: 100 };
+async function dayStats(k, d, mine) {
+  const V = ((await db(['HVALS', 'dsc:' + k + ':' + d])) || []).map(Number).filter(Number.isFinite);
+  const hist = new Array(11).fill(0); let sum = 0, below = 0, eq = 0;
+  V.forEach(v => { sum += v; hist[Math.max(0, Math.min(10, Math.round(v / 10)))]++; if (mine != null) { if (v < mine) below++; else if (v === mine) eq++; } });
+  return { n: V.length, avg: V.length ? Math.round(sum / V.length) : 0, hist, below, eq };
+}
+async function daySub(m) {
+  if (!(await lbAuth(m.pid, m.pkey))) return { error: 'auth' };
+  const max = DSC_KINDS[m.k]; if (!max || !dayOk(m.d)) return { error: 'bad' };
+  const s = Math.round(+m.s); if (!(s >= 0 && s <= max)) return { error: 'bad' };
+  const key = 'dsc:' + m.k + ':' + m.d;
+  await dbMany([['HSETNX', key, m.pid, s], ['EXPIRE', key, 3 * 86400]]);
+  const mine = +(await db(['HGET', key, m.pid]));
+  return Object.assign({ mine }, await dayStats(m.k, m.d, mine));
+}
+async function dayGet(m) {
+  if (!DSC_KINDS[m.k] || !dayOk(m.d)) return { error: 'bad' };
+  let mine = null; if (okId(m.pid)) { const v = await db(['HGET', 'dsc:' + m.k + ':' + m.d, m.pid]); if (v != null) mine = +v; }
+  return Object.assign({ mine }, await dayStats(m.k, m.d, mine));
+}
+const DATA_OPS = { giftget: giftGet, rep: repPut, stat: statPut, lbadm: lbAdmin, lgnew: lgNew, lgjoin: lgJoin, lgget: lgGet, lgput: lgPut, lgleave: lgLeave, clubm: clubMembers, clubq: clubSearch, sugg: suggAdd, sggl: suggList, lbput: lbPut, lbget: lbGet, lbdel: lbDel, cdel: cloudDel, cnew: cloudNew, cput: cloudPut, cget: cloudGet, clink: cloudLink, cjoin: cloudJoin, invsend: invSend, invget: invGet, dsc: daySub, dsg: dayGet };
 
 const createdBy = new Map(); // identifiant de création -> code (évite les salons en double après une coupure)
 const rooms = new Map(); // code -> {code, created, touched, players: [{id, token, name, ws, seat, leftAt}], log: []}
@@ -592,7 +636,7 @@ const server = http.createServer((req, res) => {
   }
   if (req.url === '/health') {
     res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
-    res.end(JSON.stringify({ ok: true, v: '1.10', rooms: rooms.size, uptime: Math.round(process.uptime()), db: DB_ON ? 'upstash' : 'memoire' }));
+    res.end(JSON.stringify({ ok: true, v: '1.13', rooms: rooms.size, uptime: Math.round(process.uptime()), db: DB_ON ? 'upstash' : 'memoire' }));
     return;
   }
   res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
