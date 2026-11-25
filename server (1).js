@@ -1,0 +1,832 @@
+// F-QUIZ — serveur de salons pour le multijoueur en ligne
+// Rôle : relayer les messages entre les joueurs d'un salon (2 pour les duels, jusqu'à 8 pour le Grand Prix). Le serveur ne connaît pas les avions secrets :
+// chaque appareil répond lui-même aux questions sur son propre avion.
+//
+// Démarrage : node server.js   (port : variable PORT, 8787 par défaut)
+// Santé : GET /health → {"ok":true,...,"db":"upstash"|"memoire"}
+// v1.9 : statistiques anonymes d'utilisation (stat) et page /stats?k=CLÉ_ADMIN
+// v1.10 : signalements des joueurs (rep) et page /reports?k=CLÉ_ADMIN
+// v1.16 : « Continuer avec Google » (cgoo) : la sauvegarde en ligne est reliée au compte Google (on ne garde que l'empreinte de son identifiant, ni e-mail ni nom)
+// v1.15 : clé de secours permanente de la sauvegarde en ligne (crk / crj) : suffit à tout récupérer si les données du navigateur sont effacées
+// v1.14 : classement Blitz de la semaine (lb blz : meilleur Blitz de reconnaissance visuelle toutes catégories, remis à zéro le lundi)
+// v1.13 : rendre son XP à un joueur qui a perdu sa progression (lbadm act 'gift' depuis le panneau de contrôle, récupérée par le jeu avec giftget)
+// v1.12 : comparaison de l'Examen du jour (dsc : envoie son score et reçoit la répartition du jour ; dsg : répartition seule)
+// v1.11 : invitations dans le jeu (invsend / invget) : une invitation vers un salon, gardée 15 min pour le joueur invité
+// v1.8 : fiche joueur des classements (statistiques publiques envoyées avec lbput, renvoyées par lbget)
+// v1.7 : page « Mon aéroclub » (clubm : membres du club)
+// v1.6 : recherche d'aéroclub (clubq) ; création de salon idempotente (plus de salon en double quand le serveur se réveille)
+// v1.5 : ligue des aéroclubs (lb club) et suggestions d'avions (sugg/sggl)
+// v1.4 : soirée club (salons jusqu'à 40 appareils)
+// v1.3 : suppression des données en ligne (lbdel/cdel), filtre des noms grossiers
+// v1.2 : classements (lbput/lbget) et sauvegarde en ligne (cnew/cput/cget/clink/cjoin), stockés dans Upstash Redis
+
+const http = require('http');
+const { WebSocketServer } = require('ws');
+
+const PORT = +process.env.PORT || 8787;
+const ROOM_TTL_MS = 2 * 60 * 60 * 1000;      // un salon inactif disparaît au bout de 2 h
+const RECONNECT_GRACE_MS = 10 * 60 * 1000;   // un joueur déconnecté (appli en arrière-plan, coupure) garde sa place 10 min
+const MAX_MSG_BYTES = 64 * 1024;
+const MAX_MSGS_PER_10S = 120;
+const MAX_PLAYERS = 8;                         // duels à 2, Grand Prix jusqu'à 8
+const CLUB_MAX = 40;                           // soirée club : un animateur + jusqu'à 39 joueurs
+const roomCap = r => (r.meta && r.meta.game === 'club') ? CLUB_MAX : MAX_PLAYERS;
+const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // sans I, O, 0, 1 (confusions)
+
+// Transfert de compte : la progression est déposée 15 min sous un code court, lisible une seule fois
+const XFER_TTL_MS = 30 * 60 * 1000;
+const XFER_GRACE_S = 600; // après la première lecture, le code reste valable 10 min (nouvel essai si le réseau a coupé)
+const XFER_MAX_BYTES = 1024 * 1024;
+const xfers = new Map(); // code -> {data, at}
+function makeXferCode() {
+  for (let n = 0; n < 50; n++) {
+    let c = '';
+    for (let i = 0; i < 6; i++) c += CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)];
+    if (!xfers.has(c)) return c;
+  }
+  throw new Error('no code');
+}
+setInterval(() => { const now = Date.now(); for (const [k, v] of xfers) if (now - v.at > XFER_TTL_MS) xfers.delete(k); }, 60 * 1000).unref();
+
+
+// ===== Données durables : classements et sauvegarde en ligne =====
+// Base Upstash Redis (variables UPSTASH_REDIS_REST_URL et UPSTASH_REDIS_REST_TOKEN sur Render).
+// Sans ces variables, tout reste en mémoire (perdu quand le serveur s'endort) : pratique pour tester.
+const crypto = require('crypto');
+const UP_URL = (process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/$/, '');
+const UP_TOK = process.env.UPSTASH_REDIS_REST_TOKEN || '';
+const DB_ON = !!(UP_URL && UP_TOK);
+const SAVE_MAX = 900 * 1024;
+const sha = s => crypto.createHash('sha256').update(String(s)).digest('hex');
+const mem = { kv: new Map(), z: new Map(), exp: new Map() };
+function memExpired(k) { const e = mem.exp.get(k); if (e && e < Date.now()) { mem.kv.delete(k); mem.z.delete(k); mem.exp.delete(k); return true; } return false; }
+// mini-Redis en mémoire (les seules commandes utilisées)
+function memCmd(c) {
+  const [op, k] = [String(c[0]).toUpperCase(), c[1]];
+  if (k !== undefined) memExpired(k);
+  switch (op) {
+    case 'GET': return mem.kv.has(k) ? mem.kv.get(k) : null;
+    case 'SET': {
+      const nx = c.includes('NX'); if (nx && mem.kv.has(k)) return null;
+      mem.kv.set(k, String(c[2])); const ex = c.indexOf('EX'); if (ex > 0) mem.exp.set(k, Date.now() + (+c[ex + 1]) * 1000); return 'OK';
+    }
+    case 'DEL': { let n = 0; c.slice(1).forEach(x => { if (mem.kv.delete(x)) n++; if (mem.z.delete(x)) n++; }); return n; }
+    case 'ZINCRBY': { const z = mem.z.get(k) || new Map(); mem.z.set(k, z); const v = (z.get(String(c[3])) || 0) + (+c[2]); z.set(String(c[3]), v); return String(v); }
+    case 'SADD': { const set = mem.kv.get(k) instanceof Set ? mem.kv.get(k) : new Set(); mem.kv.set(k, set); const had = set.has(String(c[2])); set.add(String(c[2])); return had ? 0 : 1; }
+    case 'SISMEMBER': { const set = mem.kv.get(k); return set instanceof Set && set.has(String(c[2])) ? 1 : 0; }
+    case 'ZREM': { const z = mem.z.get(k); return z && z.delete(String(c[2])) ? 1 : 0; }
+    case 'INCR': { const v = (+mem.kv.get(k) || 0) + 1; mem.kv.set(k, String(v)); return v; }
+    case 'MGET': return c.slice(1).map(x => (memExpired(x), mem.kv.has(x) ? mem.kv.get(x) : null));
+    case 'EXPIRE': mem.exp.set(k, Date.now() + (+c[2]) * 1000); return 1;
+    case 'ZADD': {
+      // ZADD key [GT|LT] score member
+      let i = 2, mode = null; if (c[i] === 'GT' || c[i] === 'LT') mode = c[i++];
+      const sc = +c[i], m = String(c[i + 1]); const z = mem.z.get(k) || new Map(); mem.z.set(k, z);
+      const old = z.get(m);
+      if (old === undefined || !mode || (mode === 'GT' && sc > old) || (mode === 'LT' && sc < old)) z.set(m, sc);
+      return 1;
+    }
+    case 'HINCRBY': { const h = mem.kv.get(k) instanceof Map ? mem.kv.get(k) : new Map(); mem.kv.set(k, h); const v = (h.get(String(c[2])) || 0) + (+c[3]); h.set(String(c[2]), v); return v; }
+    case 'HSETNX': { const h = mem.kv.get(k) instanceof Map ? mem.kv.get(k) : new Map(); mem.kv.set(k, h); if (h.has(String(c[2]))) return 0; h.set(String(c[2]), String(c[3])); return 1; }
+    case 'HGET': { const h = mem.kv.get(k); return h instanceof Map && h.has(String(c[2])) ? String(h.get(String(c[2]))) : null; }
+    case 'HVALS': { const h = mem.kv.get(k); return h instanceof Map ? [...h.values()].map(String) : []; }
+    case 'HGETALL': { const h = mem.kv.get(k); if (!(h instanceof Map)) return []; const out = []; h.forEach((v, f) => out.push(f, String(v))); return out; }
+    case 'PFADD': { const set = mem.kv.get(k) instanceof Set ? mem.kv.get(k) : new Set(); mem.kv.set(k, set); const n0 = set.size; c.slice(2).forEach(x => set.add(String(x))); return set.size > n0 ? 1 : 0; }
+    case 'PFCOUNT': { const u = new Set(); c.slice(1).forEach(x => { const set = mem.kv.get(x); if (set instanceof Set) set.forEach(y => u.add(y)); }); return u.size; }
+    case 'ZSCORE': { const z = mem.z.get(k); const v = z && z.get(String(c[2])); return v === undefined ? null : String(v); }
+    case 'ZCOUNT': { const z = mem.z.get(k); if (!z) return 0; const lo = c[2] === '-inf' ? -Infinity : +c[2], hi = c[3] === '+inf' ? Infinity : +c[3]; return [...z.values()].filter(v => v >= lo && v <= hi).length; }
+    case 'LPUSH': { const l = Array.isArray(mem.kv.get(k)) ? mem.kv.get(k) : []; mem.kv.set(k, l); c.slice(2).forEach(x => l.unshift(String(x))); return l.length; }
+    case 'LTRIM': { const l = mem.kv.get(k); if (Array.isArray(l)) mem.kv.set(k, l.slice(+c[2], +c[3] + 1)); return 'OK'; }
+    case 'LRANGE': { const l = mem.kv.get(k); return Array.isArray(l) ? l.slice(+c[2], +c[3] < 0 ? undefined : +c[3] + 1) : []; }
+    case 'LREM': { const l = mem.kv.get(k); if (!Array.isArray(l)) return 0; const n0 = l.length; mem.kv.set(k, l.filter(x => x !== String(c[3]))); return n0 - mem.kv.get(k).length; }
+    case 'ZCARD': { const z = mem.z.get(k); return z ? z.size : 0; }
+    case 'ZRANGE': {
+      // ZRANGE key start stop [REV] WITHSCORES
+      const z = mem.z.get(k); if (!z) return [];
+      const rev = c.includes('REV'); const arr = [...z.entries()].sort((a, b) => rev ? b[1] - a[1] : a[1] - b[1]);
+      const out = []; arr.slice(+c[2], +c[3] + 1).forEach(([m, sc]) => out.push(m, String(sc))); return out;
+    }
+    case 'ZRANK': case 'ZREVRANK': {
+      const z = mem.z.get(k); if (!z || !z.has(String(c[2]))) return null;
+      const arr = [...z.entries()].sort((a, b) => op === 'ZREVRANK' ? b[1] - a[1] : a[1] - b[1]); return arr.findIndex(e => e[0] === String(c[2]));
+    }
+  }
+  throw new Error('cmd ' + op);
+}
+async function db(cmd) {
+  if (!DB_ON) return memCmd(cmd);
+  const r = await fetch(UP_URL, { method: 'POST', headers: { Authorization: 'Bearer ' + UP_TOK, 'content-type': 'application/json' }, body: JSON.stringify(cmd) });
+  const j = await r.json(); if (j.error) throw new Error(j.error); return j.result;
+}
+async function dbMany(cmds) {
+  if (!DB_ON) return cmds.map(memCmd);
+  const r = await fetch(UP_URL + '/pipeline', { method: 'POST', headers: { Authorization: 'Bearer ' + UP_TOK, 'content-type': 'application/json' }, body: JSON.stringify(cmds) });
+  const j = await r.json(); if (!Array.isArray(j)) throw new Error('pipeline'); return j.map(x => { if (x.error) throw new Error(x.error); return x.result; });
+}
+const okId = s => typeof s === 'string' && /^[a-z0-9]{8,32}$/.test(s);
+const okKey = s => typeof s === 'string' && s.length >= 16 && s.length <= 64;
+// Filtre des noms grossiers (classements et salons) : le nom est remplacé par « Pilote »
+const BAD_LONG = ['connard', 'connasse', 'salope', 'salaud', 'putain', 'pute', 'encule', 'enculer', 'batard', 'merde', 'couille', 'niquer', 'nique', 'ntm', 'tagueule', 'pede', 'tapette', 'gouine', 'bougnoul', 'negro', 'nazi', 'hitler', 'fuck', 'shit', 'bitch', 'cunt', 'dick', 'pussy', 'nigger', 'nigga', 'faggot', 'whore', 'slut', 'porn', 'asshole', 'bite', 'zizi', 'chatte', 'branleur', 'branle', 'suceur', 'sucemoi', 'fdp', 'ta mere', 'tamere', 'pd'];
+const BAD_WORD = ['con', 'cul', 'fag', 'sex', 'pd', 'fdp', 'ntm', 'kkk', 'ass'];
+function rude(name) {
+  const base = String(name).toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .replace(/0/g, 'o').replace(/1|!/g, 'i').replace(/3/g, 'e').replace(/4|@/g, 'a').replace(/5|\$/g, 's').replace(/7/g, 't');
+  const squash = base.replace(/[^a-z]/g, ''), words = base.split(/[^a-z]+/).filter(Boolean);
+  return BAD_LONG.some(w => w.replace(/ /g, '').length >= 5 ? squash.includes(w.replace(/ /g, '')) : words.includes(w)) || BAD_WORD.some(w => words.includes(w));
+}
+const cleanName = s => { const n = String(s || '').replace(/[\u0000-\u001f<>]/g, '').trim().slice(0, 24); return !n || rude(n) ? 'Pilote' : n; };
+// semaine ISO (lundi → dimanche), en heure de Paris à peu près (UTC+1)
+function weekKey(t) {
+  const d = new Date((t || Date.now()) + 3600e3); d.setUTCHours(0, 0, 0, 0);
+  const day = d.getUTCDay() || 7; d.setUTCDate(d.getUTCDate() + 4 - day);
+  const y0 = new Date(Date.UTC(d.getUTCFullYear(), 0, 1)); const w = Math.ceil(((d - y0) / 864e5 + 1) / 7);
+  return d.getUTCFullYear() + '-W' + String(w).padStart(2, '0');
+}
+const DAY_RE = /^\d{4}-\d{1,2}-\d{1,2}$/;
+function dayOk(d) { if (!DAY_RE.test(d)) return false; const [y, m, j] = d.split('-').map(Number); const t = Date.UTC(y, m - 1, j); return Math.abs(t - Date.now()) < 2.2 * 864e5; }
+// Classements : lb:xp (XP total), lb:wxp:<semaine> (XP gagnée cette semaine), lb:day:<date> (essais pour trouver l'avion du jour, le moins possible)
+const LB = {
+  xp: { key: () => 'lb:xp', high: true, max: 1e7 },
+  wxp: { key: () => 'lb:wxp:' + weekKey(), high: true, max: 2e5, ttl: 45 * 864e5 },
+  day: { key: d => 'lb:day:' + d, high: false, max: 999, ttl: 10 * 864e5 },
+  blz: { key: () => 'lb:blz:' + weekKey(), high: true, max: 300, ttl: 45 * 864e5 }
+};
+async function lbAuth(pid, pkey) {
+  if (!okId(pid) || !okKey(pkey)) return false;
+  const h = sha(pkey);
+  const set = await db(['SET', 'lbk:' + pid, h, 'NX']);
+  if (set === 'OK') return true;
+  return (await db(['GET', 'lbk:' + pid])) === h;
+}
+// statistiques publiques de la fiche joueur : uniquement des nombres entiers bornés, clés connues
+const STAT_KEYS = ['w', 'p', 'd', 'bs', 'b', 'm', 'bg'];
+function cleanStats(x) {
+  if (!x || typeof x !== 'object') return undefined;
+  const o = {}; STAT_KEYS.forEach(k => { const v = Math.round(+x[k]); if (Number.isFinite(v) && v >= 0 && v <= 1e6) o[k] = v; });
+  return Object.keys(o).length ? o : undefined;
+}
+async function lbPut(m) {
+  if (!(await lbAuth(m.pid, m.pkey))) return { error: 'auth' };
+  const meta = JSON.stringify({ n: cleanName(m.name), av: String(m.av || '').slice(0, 40), ban: String(m.ban || '').slice(0, 24), g: String(m.grade || '').slice(0, 40), c: cleanClub(m.club), x: cleanStats(m.stats), at: Date.now() });
+  const cmds = [['SET', 'lbp:' + m.pid, meta]];
+  (Array.isArray(m.entries) ? m.entries : []).slice(0, 5).forEach(e => {
+    const B = LB[e && e.b]; if (!B) return; const s = Math.round(+e.s);
+    if (!(s >= (B.high ? 0 : 1)) || s > B.max) return;
+    if (e.b === 'day' && !dayOk(e.d)) return;
+    const k = B.key(e.d);
+    cmds.push(['ZADD', k, B.high ? 'GT' : 'LT', s, m.pid]);
+    if (B.ttl) cmds.push(['EXPIRE', k, Math.round(B.ttl / 1000)]);
+  });
+  const xpE = (m.entries || []).find(e => e && e.b === 'xp');
+  if (m.club !== undefined && xpE) await clubUpdate(m.pid, m.club, Math.max(0, Math.min(1e7, Math.round(+xpE.s) || 0)), cmds);
+  await dbMany(cmds);
+  return { ok: true };
+}
+// ---------- Ligue des aéroclubs : l'XP de chaque membre s'additionne à celle de son club ----------
+const normKey = s => String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]/g, '').slice(0, 40);
+const cleanClub = s => { const n = String(s || '').replace(/[\u0000-\u001f<>]/g, '').replace(/\s+/g, ' ').trim().slice(0, 32); return n && !rude(n) && normKey(n).length >= 2 ? n : ''; };
+async function clubUpdate(pid, clubName, xp, cmds) {
+  const name = cleanClub(clubName), k = normKey(name);
+  let prev = null; try { prev = JSON.parse(await db(['GET', 'lbc:' + pid]) || 'null'); } catch (e) {}
+  if (prev && prev.k === k) { const d = xp - (prev.xp || 0); if (k && d > 0) cmds.push(['ZINCRBY', 'lb:club', d, k]); }
+  else {
+    if (prev && prev.k) { cmds.push(['ZINCRBY', 'lb:club', -(prev.xp || 0), prev.k], ['ZINCRBY', 'lb:clubn', -1, prev.k], ['ZREM', 'lbcm:' + prev.k, pid]); }
+    if (k) cmds.push(['ZINCRBY', 'lb:club', xp, k], ['ZINCRBY', 'lb:clubn', 1, k]);
+  }
+  if (k) cmds.push(['SET', 'lbcn:' + k, name, 'NX'], ['ZADD', 'lbcm:' + k, xp, pid]); // membres du club (XP de chacun)
+  cmds.push(k ? ['SET', 'lbc:' + pid, JSON.stringify({ k, xp: Math.max(xp, prev && prev.k === k ? prev.xp || 0 : 0) })] : ['DEL', 'lbc:' + pid]);
+}
+async function lbDel(m) {
+  if (!(await lbAuth(m.pid, m.pkey))) return { error: 'auth' };
+  return lbWipe(m.pid);
+}
+async function lbWipe(pid) {
+  const m = { pid };
+  const now = Date.now(), days = [-1, 0, 1].map(k => { const d = new Date(now + k * 864e5); return d.getUTCFullYear() + '-' + (d.getUTCMonth() + 1) + '-' + d.getUTCDate(); });
+  const cmds = [['ZREM', 'lb:xp', m.pid], ['ZREM', 'lb:wxp:' + weekKey(), m.pid], ['ZREM', 'lb:wxp:' + weekKey(now - 7 * 864e5), m.pid], ['ZREM', 'lb:blz:' + weekKey(), m.pid], ['ZREM', 'lb:blz:' + weekKey(now - 7 * 864e5), m.pid]]
+    .concat(days.map(d => ['ZREM', 'lb:day:' + d, m.pid]), [['DEL', 'lbp:' + m.pid, 'lbk:' + m.pid]]);
+  await clubUpdate(m.pid, '', 0, cmds);
+  await dbMany(cmds);
+  return { ok: true };
+}
+async function clubGet(m) {
+  const res = await dbMany([['ZRANGE', 'lb:club', 0, 59, 'REV', 'WITHSCORES'], ['ZCOUNT', 'lb:clubn', 1, '+inf']]);
+  const flat = res[0] || [], ks = []; for (let i = 0; i < flat.length; i += 2) ks.push([flat[i], Math.max(0, +flat[i + 1])]);
+  const extra = ks.length ? await dbMany(ks.map(([k]) => ['GET', 'lbcn:' + k]).concat(ks.map(([k]) => ['ZSCORE', 'lb:clubn', k]))) : [];
+  const mk = normKey(cleanClub(m.club));
+  // un club sans membre (tous partis) disparaît du classement ; un club à 0 XP avec des membres y figure
+  const top = ks.map(([k, s], i) => ({ n: extra[i] || k, s, m: Math.max(0, +extra[ks.length + i] || 0), me: !!mk && k === mk })).filter(x => x.m > 0);
+  let me = null; if (mk) { const r = await dbMany([['ZREVRANK', 'lb:club', mk], ['ZSCORE', 'lb:club', mk], ['ZSCORE', 'lb:clubn', mk]]); if (r[0] !== null && r[0] !== undefined) me = { rank: +r[0] + 1, s: +r[1], m: +r[2] || 0, n: cleanClub(m.club) }; }
+  return { top: top.slice(0, 50), total: +res[1] || 0, me };
+}
+// recherche de club pendant la saisie (pour rejoindre un club existant au lieu d'en créer un doublon)
+async function clubSearch(m) {
+  const q = normKey(m.q); if (q.length < 2) return { list: [] };
+  const flat = await db(['ZRANGE', 'lb:clubn', 0, 999, 'REV', 'WITHSCORES']) || [], ks = [];
+  for (let i = 0; i < flat.length; i += 2) if (+flat[i + 1] > 0) ks.push([flat[i], +flat[i + 1]]);
+  const hit = ks.filter(([k]) => k.includes(q)).sort((a, b) => (b[0] === q) - (a[0] === q) || (b[0].startsWith(q)) - (a[0].startsWith(q)) || b[1] - a[1]).slice(0, 6);
+  if (!hit.length) return { list: [] };
+  const ex = await dbMany(hit.map(([k]) => ['GET', 'lbcn:' + k]).concat(hit.map(([k]) => ['ZSCORE', 'lb:club', k])));
+  return { list: hit.map(([k, n], i) => ({ k, n: ex[i] || k, m: n, s: Math.max(0, +ex[hit.length + i] || 0), exact: k === q })) };
+}
+// page « Mon aéroclub » : membres (XP, grade, bannière), XP de la semaine, rang du club dans la ligue
+async function clubMembers(m) {
+  const k = normKey(cleanClub(m.club)); if (k.length < 2) return { error: 'bad' };
+  const res = await dbMany([['ZRANGE', 'lbcm:' + k, 0, 99, 'REV', 'WITHSCORES'], ['GET', 'lbcn:' + k], ['ZREVRANK', 'lb:club', k], ['ZSCORE', 'lb:club', k], ['ZCOUNT', 'lb:clubn', 1, '+inf']]);
+  const flat = res[0] || [], ids = []; for (let i = 0; i < flat.length; i += 2) ids.push([flat[i], +flat[i + 1]]);
+  const wk = 'lb:wxp:' + weekKey();
+  const ex = ids.length ? await dbMany(ids.map(([id]) => ['GET', 'lbp:' + id]).concat(ids.map(([id]) => ['ZSCORE', wk, id]))) : [];
+  const members = ids.map(([id, xp], i) => { let mt = {}; try { mt = JSON.parse(ex[i] || '{}') || {}; } catch (e) {}
+    return { n: mt.n || 'Pilote', av: mt.av || '', ban: mt.ban || '', g: mt.g || '', xp, w: Math.max(0, +ex[ids.length + i] || 0), me: id === m.pid }; });
+  return { name: res[1] || cleanClub(m.club), members, rank: res[2] === null || res[2] === undefined ? null : +res[2] + 1, total: Math.max(0, +res[3] || 0), clubs: +res[4] || 0 };
+}
+async function lbGet(m) {
+  if (m.b === 'club') return clubGet(m);
+  const B = LB[m.b]; if (!B) return { error: 'board' };
+  if (m.b === 'day' && !DAY_RE.test(m.d || '')) return { error: 'day' };
+  const k = B.key(m.d);
+  const res = await dbMany([['ZRANGE', k, 0, 49].concat(B.high ? ['REV'] : [], ['WITHSCORES']), ['ZCARD', k]].concat(okId(m.pid) ? [[B.high ? 'ZREVRANK' : 'ZRANK', k, m.pid], ['ZSCORE', k, m.pid]] : []));
+  const flat = res[0] || [], ids = []; for (let i = 0; i < flat.length; i += 2) ids.push([flat[i], +flat[i + 1]]);
+  const metas = ids.length ? await db(['MGET'].concat(ids.map(x => 'lbp:' + x[0]))) : [];
+  const top = ids.map(([id, s], i) => { let mt = {}; try { mt = JSON.parse(metas[i] || '{}') || {}; } catch (e) {} return { n: mt.n || 'Pilote', av: mt.av || '', ban: mt.ban || '', g: mt.g || '', c: mt.c || '', x: mt.x || null, at: mt.at || 0, s, me: id === m.pid }; });
+  const me = okId(m.pid) && res[2] !== null && res[2] !== undefined ? { rank: +res[2] + 1, s: +res[3] } : null;
+  return { top, total: +res[1] || 0, me, week: m.b === 'wxp' || m.b === 'blz' ? weekKey() : undefined };
+}
+// Sauvegarde en ligne : un compte = un identifiant + une clé secrète (gardés sur les appareils reliés)
+async function cAuth(id, s) {
+  if (!okId(id) || !okKey(s)) return false;
+  return (await db(['GET', 'cacc:' + id])) === sha(s);
+}
+async function cloudNew() {
+  const id = crypto.randomBytes(8).toString('hex'), s = crypto.randomBytes(18).toString('base64').replace(/[+/=]/g, '').slice(0, 24);
+  await db(['SET', 'cacc:' + id, sha(s), 'NX']);
+  return { acc: id, s };
+}
+async function cloudPut(m) {
+  if (!(await cAuth(m.acc, m.s))) return { error: 'auth' };
+  const data = String(m.data || '');
+  if (!/^FQSAVE\d\./.test(data) || data.length > SAVE_MAX) return { error: 'bad' };
+  const cur = +(await db(['GET', 'crev:' + m.acc])) || 0;
+  if (!m.force && (+m.rev || 0) !== cur) return { conflict: true, rev: cur };
+  const rev = cur + 1;
+  await dbMany([['SET', 'csav:' + m.acc, data], ['SET', 'crev:' + m.acc, String(rev)], ['SET', 'cat:' + m.acc, String(Date.now())]]);
+  return { ok: true, rev };
+}
+async function cloudGet(m) {
+  if (!(await cAuth(m.acc, m.s))) return { error: 'auth' };
+  const [rev, at] = await db(['MGET', 'crev:' + m.acc, 'cat:' + m.acc]);
+  const r = +rev || 0;
+  if (m.rev !== undefined && +m.rev === r) return { same: true, rev: r };
+  const data = r ? await db(['GET', 'csav:' + m.acc]) : null;
+  return { rev: r, at: +at || 0, data };
+}
+async function cloudDel(m) {
+  if (!(await cAuth(m.acc, m.s))) return { error: 'auth' };
+  const rk = await db(['GET', 'crka:' + m.acc]), gk = await db(['GET', 'cga:' + m.acc]);
+  await db(['DEL', 'cacc:' + m.acc, 'csav:' + m.acc, 'crev:' + m.acc, 'cat:' + m.acc, 'crka:' + m.acc, 'cga:' + m.acc].concat(rk ? ['crk:' + rk] : [], gk ? [gk] : []));
+  return { ok: true };
+}
+async function cloudLink(m) {
+  if (!(await cAuth(m.acc, m.s))) return { error: 'auth' };
+  for (let n = 0; n < 20; n++) {
+    let c = ''; for (let i = 0; i < 6; i++) c += CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)];
+    if ((await db(['SET', 'clink:' + c, JSON.stringify({ acc: m.acc, s: m.s }), 'EX', Math.round(XFER_TTL_MS / 1000), 'NX'])) === 'OK') return { code: c, ttl: XFER_TTL_MS };
+  }
+  return { error: 'busy' };
+}
+async function cloudJoin(m) {
+  const c = String(m.code || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const v = await db(['GET', 'clink:' + c]);
+  if (!v) return { error: 'not found' };
+  await db(['EXPIRE', 'clink:' + c, XFER_GRACE_S]);
+  return JSON.parse(v);
+}
+// clé de secours : 12 caractères, permanente, liée au compte de sauvegarde ; elle seule suffit à le récupérer
+async function cloudKey(m) {
+  if (!(await cAuth(m.acc, m.s))) return { error: 'auth' };
+  const old = await db(['GET', 'crka:' + m.acc]); if (old) return { key: old };
+  for (let n = 0; n < 20; n++) {
+    let k = ''; for (let i = 0; i < 12; i++) k += CODE_ALPHABET[crypto.randomInt(CODE_ALPHABET.length)];
+    if ((await db(['SET', 'crk:' + k, JSON.stringify({ acc: m.acc, s: m.s }), 'NX'])) === 'OK') { await db(['SET', 'crka:' + m.acc, k]); return { key: k }; }
+  }
+  return { error: 'busy' };
+}
+async function cloudRecover(m) {
+  const k = String(m.key || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (k.length !== 12) return { error: 'bad' };
+  const v = await db(['GET', 'crk:' + k]); if (!v) return { error: 'not found' };
+  let o; try { o = JSON.parse(v); } catch (e) { return { error: 'not found' }; }
+  if (!(await cAuth(o.acc, o.s))) return { error: 'not found' };
+  return { acc: o.acc, s: o.s };
+}
+// Connexion Google : le jeu envoie le jeton d'identité signé par Google ; on le vérifie auprès de Google,
+// puis on relie l'identifiant Google (son empreinte seulement) au compte de sauvegarde
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '900162060707-in1slaicki67ug0jdt901eca1decjkqe.apps.googleusercontent.com';  // identifiant public du client web F-QUIZ (Google Cloud › F-QUIZ)
+async function googleSub(idt) {
+  if (!GOOGLE_CLIENT_ID || typeof idt !== 'string' || idt.length > 4096) return null;
+  if (process.env.GOOGLE_TEST === '1' && /^TEST:\w+$/.test(idt)) return idt.slice(5);   // tests locaux uniquement (jamais activé sur Render)
+  try {
+    const r = await fetch('https://oauth2.googleapis.com/tokeninfo?id_token=' + encodeURIComponent(idt));
+    if (!r.ok) return null;
+    const t = await r.json();
+    if (t.aud !== GOOGLE_CLIENT_ID || !['accounts.google.com', 'https://accounts.google.com'].includes(t.iss) || !(+t.exp * 1000 > Date.now()) || !t.sub) return null;
+    return String(t.sub);
+  } catch (e) { return null; }
+}
+async function cloudGoogle(m) {
+  if (!GOOGLE_CLIENT_ID) return { error: 'off' };
+  const sub = await googleSub(m.idt); if (!sub) return { error: 'auth' };
+  const k = 'cg:' + sha('g:' + sub);
+  const v = await db(['GET', k]);
+  if (v) { try { const o = JSON.parse(v); if (await cAuth(o.acc, o.s)) return { acc: o.acc, s: o.s, existed: true }; } catch (e) {} }
+  // pas encore relié : on relie la sauvegarde de cet appareil, ou on en crée une
+  let o = null;
+  if (m.acc && m.s && await cAuth(m.acc, m.s)) o = { acc: m.acc, s: m.s };
+  else o = await cloudNew();
+  await db(['SET', k, JSON.stringify(o)]);
+  await db(['SET', 'cga:' + o.acc, k]);
+  return { acc: o.acc, s: o.s, linked: true };
+}
+// ---------- Suggestions d'avions à ajouter (une voix par joueur et par avion) ----------
+async function suggAdd(m) {
+  if (!(await lbAuth(m.pid, m.pkey))) return { error: 'auth' };
+  const name = String(m.name || '').replace(/[\u0000-\u001f<>]/g, '').replace(/\s+/g, ' ').trim().slice(0, 40), k = normKey(name);
+  if (k.length < 3 || rude(name)) return { error: 'bad' };
+  const added = await db(['SADD', 'sgv:' + k, m.pid]);
+  if (+added === 1) await dbMany([['ZINCRBY', 'sg:z', 1, k], ['SET', 'sgn:' + k, name, 'NX']]);
+  return { ok: true, voted: +added === 1 };
+}
+async function suggList(m) {
+  const flat = await db(['ZRANGE', 'sg:z', 0, 39, 'REV', 'WITHSCORES']) || [], ks = [];
+  for (let i = 0; i < flat.length; i += 2) ks.push([flat[i], +flat[i + 1]]);
+  if (!ks.length) return { list: [] };
+  const ex = await dbMany(ks.map(([k]) => ['GET', 'sgn:' + k]).concat(okId(m.pid) ? ks.map(([k]) => ['SISMEMBER', 'sgv:' + k, m.pid]) : []));
+  return { list: ks.map(([k, v], i) => ({ k, n: ex[i] || k, v, me: okId(m.pid) ? +ex[ks.length + i] === 1 : false })) };
+}
+
+// ---------- Ligues entre amis : une épreuve par jour pendant N jours, mêmes questions pour tous, un seul essai ----------
+// lg:<code> (réglages), lgm:<code> (membres, zset date d'arrivée), lgp:<code>:<pid> (nom/avatar), lgd:<code>:<jour>:<pid> (score du jour, écrit une fois)
+const LG_MAX_MEM = 40;
+const parisDay = t => { const d = new Date((t || Date.now()) + 3600e3); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()); };
+const dayUTC = s => { if (!DAY_RE.test(s || '')) return NaN; const [y, m, j] = s.split('-').map(Number); return Date.UTC(y, m - 1, j); };
+function lgCfg(c) {
+  c = c && typeof c === 'object' ? c : {};
+  const int = (v, a, b, d) => { v = Math.round(+v); return v >= a && v <= b ? v : d; };
+  const strs = (a, n) => (Array.isArray(a) ? a : []).map(x => String(x).replace(/[^a-z0-9_-]/gi, '').slice(0, 20)).filter(Boolean).slice(0, n);
+  return { n: int(c.n, 5, 20, 10), tech: int(c.tech, 0, 20, 3), fams: strs(c.fams, 8), lvl: int(c.lvl, 1, 3, 3), cats: strs(c.cats, 12), fame: !!c.fame,
+    q: ['photo', 'sil', 'name', 'mix'].includes(c.q) ? c.q : 'mix', t: int(c.t, 8, 60, 20), nopt: int(c.nopt, 3, 6, 4),
+    era: ['all', 'pion', 'edg', 'ww2', 'froide', 'mod'].includes(c.era) ? c.era : 'all', nat: ['all', 'fr', 'us', 'uk', 'de', 'urss', 'it', 'jp'].includes(c.nat) ? c.nat : 'all', speed: c.speed !== false };
+}
+async function lgLoad(code) {
+  if (!/^[A-Z2-9]{6}$/.test(code || '')) return null;
+  const raw = await db(['GET', 'lg:' + code]); if (!raw) return null;
+  try { return JSON.parse(raw); } catch (e) { return null; }
+}
+async function lgNew(m) {
+  if (!(await lbAuth(m.pid, m.pkey))) return { error: 'auth' };
+  const days = [3, 5, 7, 10, 14].includes(+m.days) ? +m.days : 7;
+  const t0 = dayUTC(m.start); if (!(Math.abs(t0 - parisDay()) <= 8 * 864e5)) return { error: 'start' };
+  const name = String(m.lname || '').replace(/[\u0000-\u001f<>]/g, '').replace(/\s+/g, ' ').trim().slice(0, 32);
+  const lg = { name: name && !rude(name) ? name : 'Ligue F-QUIZ', host: m.pid, start: m.start, days, cfg: lgCfg(m.cfg), at: Date.now() };
+  const ttl = Math.round((t0 - Date.now()) / 1000) + (days + 30) * 86400;
+  for (let n = 0; n < 30; n++) {
+    let code = ''; for (let i = 0; i < 6; i++) code += CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)];
+    if ((await db(['SET', 'lg:' + code, JSON.stringify(lg), 'NX', 'EX', ttl])) === 'OK') {
+      await lgJoin(Object.assign({}, m, { code }));
+      return { code, lg };
+    }
+  }
+  return { error: 'server' };
+}
+async function lgJoin(m) {
+  if (!(await lbAuth(m.pid, m.pkey))) return { error: 'auth' };
+  const lg = await lgLoad(m.code); if (!lg) return { error: 'gone' };
+  const ttl = Math.max(3600, Math.round((dayUTC(lg.start) - Date.now()) / 1000) + (lg.days + 30) * 86400);
+  const already = await db(['ZSCORE', 'lgm:' + m.code, m.pid]);
+  if (already === null || already === undefined) { if ((+(await db(['ZCARD', 'lgm:' + m.code])) || 0) >= LG_MAX_MEM) return { error: 'full' }; }
+  const meta = JSON.stringify({ n: cleanName(m.name), av: String(m.av || '').slice(0, 40), ban: String(m.ban || '').slice(0, 24) });
+  await dbMany([['ZADD', 'lgm:' + m.code, already === null || already === undefined ? Date.now() : +already, m.pid], ['EXPIRE', 'lgm:' + m.code, ttl], ['SET', 'lgp:' + m.code + ':' + m.pid, meta, 'EX', ttl]]);
+  return lgGet(m);
+}
+async function lgGet(m) {
+  const lg = await lgLoad(m.code); if (!lg) return { error: 'gone' };
+  const flat = (await db(['ZRANGE', 'lgm:' + m.code, 0, LG_MAX_MEM - 1, 'WITHSCORES'])) || [];
+  const ids = []; for (let i = 0; i < flat.length; i += 2) ids.push(flat[i]);
+  const keys = [];
+  ids.forEach(id => { keys.push('lgp:' + m.code + ':' + id); for (let d = 0; d < lg.days; d++) keys.push('lgd:' + m.code + ':' + d + ':' + id); });
+  const vals = keys.length ? await db(['MGET'].concat(keys)) : [];
+  const per = lg.days + 1;
+  const members = ids.map((id, i) => {
+    let mt = {}; try { mt = JSON.parse(vals[i * per] || '{}') || {}; } catch (e) {}
+    const sc = []; for (let d = 0; d < lg.days; d++) { let x = null; try { x = vals[i * per + 1 + d] ? JSON.parse(vals[i * per + 1 + d]) : null; } catch (e) {} sc.push(x); }
+    return { n: mt.n || 'Pilote', av: mt.av || '', ban: mt.ban || '', sc, me: id === m.pid, host: id === lg.host };
+  });
+  const today = Math.floor((parisDay() - dayUTC(lg.start)) / 864e5);
+  return { code: m.code, lg: Object.assign({}, lg, { host: undefined }), members, today, isHost: lg.host === m.pid, isMember: ids.includes(m.pid) };
+}
+async function lgPut(m) {
+  if (!(await lbAuth(m.pid, m.pkey))) return { error: 'auth' };
+  const lg = await lgLoad(m.code); if (!lg) return { error: 'gone' };
+  const d = Math.round(+m.d); if (!(d >= 0 && d < lg.days)) return { error: 'day' };
+  // le jour joué doit être aujourd'hui (heure de Paris, avec une marge pour les autres fuseaux)
+  const dt = dayUTC(lg.start) + d * 864e5; if (Math.abs(dt - parisDay()) > 864e5) return { error: 'day' };
+  const sc = await db(['ZSCORE', 'lgm:' + m.code, m.pid]); if (sc === null || sc === undefined) return { error: 'member' };
+  const nq = lg.cfg.n, ok = Math.max(0, Math.min(nq, Math.round(+m.ok) || 0)), p = Math.max(0, Math.min(nq * 150, Math.round(+m.p) || 0));
+  const ttl = Math.max(3600, Math.round((dayUTC(lg.start) - Date.now()) / 1000) + (lg.days + 30) * 86400);
+  const r = await db(['SET', 'lgd:' + m.code + ':' + d + ':' + m.pid, JSON.stringify({ p, ok, nq, at: Date.now() }), 'NX', 'EX', ttl]);
+  const out = await lgGet(m); out.dup = r !== 'OK'; return out;
+}
+async function lgLeave(m) {
+  if (!(await lbAuth(m.pid, m.pkey))) return { error: 'auth' };
+  await db(['ZREM', 'lgm:' + m.code, m.pid]); return { ok: true };
+}
+
+// ---------- Administration du classement (clé ADMIN_KEY dans les variables d'environnement de Render) ----------
+const ADMIN_KEY = process.env.ADMIN_KEY || '';
+async function lbAdmin(m) {
+  if (!ADMIN_KEY || typeof m.key !== 'string' || sha(m.key) !== sha(ADMIN_KEY)) return { error: 'auth' };
+  if (m.act === 'del') { if (!okId(m.pid)) return { error: 'bad' }; await lbWipe(m.pid); return { ok: true }; }
+  // rendre l'XP d'une ancienne entrée (from) au nouvel appareil du même joueur (to) ; l'ancienne entrée est retirée des classements
+  if (m.act === 'gift') {
+    if (!okId(m.from) || !okId(m.to) || m.from === m.to) return { error: 'bad' };
+    const xp = Math.round(+(await db(['ZSCORE', 'lb:xp', m.from])) || 0); if (!(xp > 0)) return { error: 'empty' };
+    const prev = Math.round(+(await db(['GET', 'lbgift:' + m.to])) || 0);
+    await db(['SET', 'lbgift:' + m.to, String(Math.min(1e7, prev + xp)), 'EX', 90 * 86400]);
+    await lbWipe(m.from);
+    return { ok: true, xp };
+  }
+  const flat = (await db(['ZRANGE', 'lb:xp', 0, 299, 'REV', 'WITHSCORES'])) || [], ids = [];
+  for (let i = 0; i < flat.length; i += 2) ids.push([flat[i], +flat[i + 1]]);
+  const metas = ids.length ? await db(['MGET'].concat(ids.map(x => 'lbp:' + x[0]))) : [];
+  return { list: ids.map(([pid, xp], i) => { let mt = {}; try { mt = JSON.parse(metas[i] || '{}') || {}; } catch (e) {} return { pid, xp, n: mt.n || 'Pilote', av: mt.av || '', g: mt.g || '', c: mt.c || '', at: mt.at || 0 }; }) };
+}
+// le jeu vient chercher l'XP qu'on lui a rendue (une seule fois)
+async function giftGet(m) {
+  if (!(await lbAuth(m.pid, m.pkey))) return { error: 'auth' };
+  const v = await db(['GET', 'lbgift:' + m.pid]); if (!v) return { xp: 0 };
+  await db(['DEL', 'lbgift:' + m.pid]);
+  return { xp: Math.max(0, Math.min(1e7, Math.round(+v) || 0)) };
+}
+// ---------- Transfert de progression : dans la base (survit aux redémarrages du serveur), en mémoire en secours ----------
+async function xferPut(data) {
+  const code = makeXferCode();
+  if (DB_ON && data.length < 900 * 1024) {
+    try { if ((await db(['SET', 'xf:' + code, data, 'EX', Math.round(XFER_TTL_MS / 1000), 'NX'])) === 'OK') return code; } catch (e) { console.error('xfer db', e.message); }
+  }
+  xfers.set(code, { data, at: Date.now() });
+  return code;
+}
+async function xferGet(k) {
+  k = String(k || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (DB_ON) { try { const v = await db(['GET', 'xf:' + k]); if (v) { await db(['EXPIRE', 'xf:' + k, XFER_GRACE_S]); return v; } } catch (e) { console.error('xfer db', e.message); } }
+  const x = xfers.get(k);
+  if (!x || Date.now() - x.at > XFER_TTL_MS) { xfers.delete(k); return null; }
+  x.at = Math.min(x.at, Date.now() - XFER_TTL_MS + XFER_GRACE_S * 1000);
+  return x.data;
+}
+// ---------- Statistiques anonymes d'utilisation (aucun nom, aucun compte : un identifiant d'appareil tiré au hasard) ----------
+const ST_TTL = 400 * 86400;
+const okMode = s => typeof s === 'string' && /^[a-z-]{2,20}$/.test(s);
+const okDay = s => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
+const isoWeek = d => { const t = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())); const n = t.getUTCDay() || 7; t.setUTCDate(t.getUTCDate() + 4 - n); const y = new Date(Date.UTC(t.getUTCFullYear(), 0, 1)); return t.getUTCFullYear() + '-S' + String(Math.ceil(((t - y) / 86400000 + 1) / 7)).padStart(2, '0'); };
+async function statPut(m) {
+  if (!okId(m.sid) || !okDay(m.d)) return { error: 'bad' };
+  const dd = new Date(m.d + 'T12:00:00Z'), age = (Date.now() - dd) / 86400000; if (!(age > -2 && age < 15)) return { ok: true };
+  const H = 'st:d:' + m.d, cmds = [], num = x => Math.max(0, Math.min(200, Math.floor(+x || 0)));
+  const open = num(m.open);
+  if (open) { cmds.push(['HINCRBY', H, 'open', open], ['PFADD', 'st:u:' + m.d, m.sid], ['PFADD', 'st:w:' + isoWeek(dd), m.sid], ['PFADD', 'st:u:all', m.sid]); }
+  if (m.nw) cmds.push(['HINCRBY', H, 'new', 1]);
+  for (const f of ['s', 'e']) { const o = m[f] && typeof m[f] === 'object' ? m[f] : {}; Object.keys(o).slice(0, 30).forEach(k => { if (okMode(k) && num(o[k])) cmds.push(['HINCRBY', H, f + ':' + k, num(o[k])]); }); }
+  if (open) {
+    if (typeof m.v === 'string' && /^[A-Za-z0-9.-]{1,20}$/.test(m.v)) cmds.push(['HINCRBY', 'st:v:' + m.d, m.v, 1]);
+    if (okMode(m.dev)) cmds.push(['HINCRBY', 'st:dev:' + m.d, m.dev, 1]);
+    cmds.push(['HINCRBY', H, m.app ? 'app' : 'nav', 1]);
+    if (m.lang === 'en') cmds.push(['HINCRBY', H, 'en', 1]);
+  }
+  if (!cmds.length) return { ok: true };
+  ['st:d:', 'st:u:', 'st:v:', 'st:dev:'].forEach(p => cmds.push(['EXPIRE', p + m.d, ST_TTL]));
+  cmds.push(['EXPIRE', 'st:w:' + isoWeek(dd), ST_TTL]);
+  await dbMany(cmds);
+  return { ok: true };
+}
+// ---------- Signalements des joueurs : avion, question, aéroport ou autre ----------
+// rep:list (les 1000 derniers, JSON), rl:rep:<sid> (20 par heure et par appareil)
+const REP_KIND = ['plane', 'question', 'airport', 'other'];
+async function repPut(m) {
+  if (!okId(m.sid)) return { error: 'bad' };
+  const n = await db(['INCR', 'rl:rep:' + m.sid]); if (+n === 1) await db(['EXPIRE', 'rl:rep:' + m.sid, 3600]);
+  if (+n > 20) return { error: 'rate' };
+  const cl = (x, l) => String(x || '').replace(/[\u0000-\u0008\u000b-\u001f]/g, '').slice(0, l);
+  const r = { t: Date.now(), k: REP_KIND.includes(m.kind) ? m.kind : 'other', ref: cl(m.ref, 80), lab: cl(m.label, 200), ty: cl(m.type, 60), msg: cl(m.msg, 1200), ctx: cl(m.ctx, 80), v: cl(m.v, 30), dev: cl(m.dev, 400), sid: m.sid.slice(0, 8) };
+  if (!r.ty && !r.msg) return { error: 'bad' };
+  await dbMany([['LPUSH', 'rep:list', JSON.stringify(r)], ['LTRIM', 'rep:list', 0, 999]]);
+  return { ok: true };
+}
+async function repPage() {
+  const L = (await db(['LRANGE', 'rep:list', 0, 499]) || []).map(x => { try { return JSON.parse(x); } catch (e) { return null; } }).filter(Boolean);
+  const KF = { plane: 'Avion', question: 'Question', airport: 'Aéroport', other: 'Autre' };
+  const cnt = {}; L.forEach(r => { const k = r.k + '|' + (r.ref || r.lab); cnt[k] = (cnt[k] || 0) + 1; });
+  const row = r => `<tr><td>${new Date(r.t).toLocaleString('fr-FR', { timeZone: 'Europe/Paris', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}</td><td><b>${KF[r.k] || r.k}</b>${cnt[r.k + '|' + (r.ref || r.lab)] > 1 ? ` <i>×${cnt[r.k + '|' + (r.ref || r.lab)]}</i>` : ''}</td><td>${esc(r.lab || r.ref)}${r.ref && r.lab ? `<small>${esc(r.ref)}</small>` : ''}</td><td><b>${esc(r.ty)}</b><br>${esc(r.msg).replace(/\n/g, '<br>')}</td><td><small>${esc(r.ctx)} · ${esc(r.v)}<br>${esc(r.dev).slice(0, 140)}</small></td></tr>`;
+  return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>F-QUIZ · Signalements</title>
+<style>body{margin:0;background:#0f1520;color:#d6dde8;font:14px/1.45 system-ui,sans-serif;padding:18px}h1{color:#F2C14E;font-size:22px;margin:0 0 4px}p{color:#9AA7B8;margin:0 0 14px}table{width:100%;border-collapse:collapse}td{border-top:1px solid #2a3446;padding:8px 6px;vertical-align:top}td:first-child{white-space:nowrap;color:#9AA7B8}small{display:block;color:#7F8B9C}i{color:#F2C14E;font-style:normal}b{color:#fff}</style>
+<h1>Signalements des joueurs</h1><p>${L.length} signalement(s), les plus récents en haut. ×N : signalé plusieurs fois.</p><table>${L.map(row).join('')}</table>`;
+}
+const hObj = a => { const o = {}; for (let i = 0; a && i < a.length; i += 2) o[a[i]] = +a[i + 1]; return o; };
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const MODE_FR = { 'radar-ia': 'Contact radar (IA)', 'radar-local': 'Contact radar (même téléphone)', 'radar-online': 'Contact radar (en ligne)', relay: 'Relais', daily: 'Avion du jour', free: 'Avion mystère libre', arpt: 'Approche finale', visual: 'Reconnaissance visuelle', 'visual-online': 'Visuel en ligne', squawk: 'Squawk', exam: 'Examen', gp: 'Grand Prix', 'tourn-online': 'Tournoi en ligne', club: 'Soirée club', league: 'Ligue', engines: 'Motoriste' };
+async function statPage(days) {
+  const D = []; for (let i = 0; i < days; i++) { const d = new Date(Date.now() - i * 86400000); D.push(d.toISOString().slice(0, 10)); }
+  const cmds = [];
+  D.forEach(d => cmds.push(['HGETALL', 'st:d:' + d], ['PFCOUNT', 'st:u:' + d], ['HGETALL', 'st:dev:' + d], ['HGETALL', 'st:v:' + d]));
+  const W = []; for (let i = 0; i < 8; i++) W.push(isoWeek(new Date(Date.now() - i * 7 * 86400000)));
+  W.forEach(w => cmds.push(['PFCOUNT', 'st:w:' + w]));
+  cmds.push(['PFCOUNT', 'st:u:all']);
+  const R = await dbMany(cmds);
+  const rows = D.map((d, i) => ({ d, h: hObj(R[i * 4]), u: +R[i * 4 + 1] || 0, dev: hObj(R[i * 4 + 2]), v: hObj(R[i * 4 + 3]) }));
+  const wk = W.map((w, i) => ({ w, u: +R[D.length * 4 + i] || 0 })), all = +R[R.length - 1] || 0;
+  const tot = {}, devT = {}, verT = {};
+  rows.forEach(r => { Object.entries(r.h).forEach(([k, v]) => tot[k] = (tot[k] || 0) + v); Object.entries(r.dev).forEach(([k, v]) => devT[k] = (devT[k] || 0) + v); });
+  (rows[0] ? Object.entries(rows[0].v).concat(rows[1] ? Object.entries(rows[1].v) : []) : []).forEach(([k, v]) => verT[k] = (verT[k] || 0) + v);
+  const modes = Object.keys(tot).filter(k => k.startsWith('s:')).map(k => k.slice(2)).sort((a, b) => (tot['s:' + b] || 0) - (tot['s:' + a] || 0));
+  const maxU = Math.max(1, ...rows.map(r => r.u)), maxM = Math.max(1, ...modes.map(m => tot['s:' + m] || 0));
+  const bar = (v, mx, c) => `<i style="display:inline-block;height:10px;border-radius:5px;background:${c};width:${Math.max(2, v / mx * 100)}%"></i>`;
+  const u7 = rows.slice(0, 7).reduce((a, r) => a + r.u, 0), n30 = tot.new || 0;
+  return `<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>F-QUIZ · statistiques</title>
+<style>body{margin:0;background:#0b1220;color:#e6ecf3;font:15px/1.45 system-ui,sans-serif;padding:18px;max-width:900px;margin:auto}h1{font-size:22px;margin:0 0 4px}h2{font-size:15px;letter-spacing:.06em;text-transform:uppercase;color:#f2c14e;margin:26px 0 8px}
+.k{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}.k div{background:#141e33;border-radius:14px;padding:12px 14px}.k b{display:block;font-size:26px}.k small{color:#9aa7b8}
+table{width:100%;border-collapse:collapse;font-size:13.5px}td,th{padding:6px 8px;border-bottom:1px solid #1e2a42;text-align:left;vertical-align:middle}th{color:#9aa7b8;font-weight:600}td.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}td.b{width:40%}p.s{color:#6b7a8e;font-size:12.5px}</style></head><body>
+<h1>📊 F-QUIZ · statistiques anonymes</h1><p class="s">${days} derniers jours · mis à jour ${esc(new Date().toLocaleString('fr-FR', { timeZone: 'Europe/Paris' }))}</p>
+<div class="k"><div><b>${rows[0] ? rows[0].u : 0}</b><small>joueurs aujourd’hui</small></div><div><b>${wk[0].u}</b><small>joueurs cette semaine</small></div><div><b>${n30}</b><small>nouveaux joueurs (${days} j)</small></div><div><b>${all}</b><small>joueurs depuis le début</small></div><div><b>${tot.open || 0}</b><small>ouvertures du jeu (${days} j)</small></div><div><b>${tot.app || 0}</b><small>ouvertures en appli installée</small></div></div>
+<h2>Modes joués (${days} j)</h2><table><tr><th>Mode</th><th></th><th>Lancées</th><th>Finies</th><th>Abandon</th></tr>${modes.map(m => { const s = tot['s:' + m] || 0, e = Math.min(s, tot['e:' + m] || 0); return `<tr><td>${esc(MODE_FR[m] || m)}</td><td class="b">${bar(s, maxM, '#f2c14e')}</td><td class="n">${s}</td><td class="n">${e}</td><td class="n">${s ? Math.round((1 - e / s) * 100) + ' %' : '—'}</td></tr>`; }).join('') || '<tr><td colspan="5">Pas encore de données.</td></tr>'}</table>
+<h2>Joueurs par jour</h2><table><tr><th>Jour</th><th></th><th>Joueurs</th><th>Nouveaux</th><th>Ouvertures</th></tr>${rows.map(r => `<tr><td>${r.d.slice(8)}/${r.d.slice(5, 7)}</td><td class="b">${bar(r.u, maxU, '#5fd38d')}</td><td class="n">${r.u}</td><td class="n">${r.h.new || 0}</td><td class="n">${r.h.open || 0}</td></tr>`).join('')}</table>
+<h2>Joueurs par semaine</h2><table>${wk.map(x => `<tr><td>${esc(x.w)}</td><td class="n">${x.u}</td></tr>`).join('')}</table>
+<h2>Appareils (${days} j)</h2><table>${Object.entries(devT).sort((a, b) => b[1] - a[1]).map(([k, v]) => `<tr><td>${esc(k)}</td><td class="n">${v}</td></tr>`).join('')}</table>
+<h2>Versions (aujourd’hui et hier)</h2><table>${Object.entries(verT).sort((a, b) => b[1] - a[1]).map(([k, v]) => `<tr><td>${esc(k)}</td><td class="n">${v}</td></tr>`).join('')}</table>
+<p class="s">« Joueurs » = appareils différents (comptage approché). « Abandon » = parties lancées puis quittées avant la fin.</p></body></html>`;
+}
+
+// ---------- invitations dans le jeu ----------
+const INV_TTL = 900, INV_MAX = 10;
+const cleanTxt = (x, n) => String(x || '').replace(/[\u0000-\u001f<>]/g, '').replace(/\s+/g, ' ').trim().slice(0, n);
+async function invSend(m) {
+  if (!(await lbAuth(m.pid, m.pkey))) return { error: 'auth' };
+  const code = String(m.code || '').toUpperCase();
+  if (!/^[A-Z0-9]{4,6}$/.test(code) || !rooms.has(code)) return { error: 'room' };
+  const to = (Array.isArray(m.to) ? m.to : []).filter(okId).filter(x => x !== m.pid).slice(0, 8);
+  if (!to.length) return { error: 'bad' };
+  const n = await db(['INCR', 'invr:' + m.pid]); if (+n === 1) await db(['EXPIRE', 'invr:' + m.pid, 60]);
+  if (+n > 6) return { error: 'busy' };
+  const inv = JSON.stringify({ from: m.pid, n: cleanTxt(m.n, 18) || 'Pilote', av: cleanTxt(m.av, 40), g: cleanTxt(m.g, 40), code, at: Date.now() });
+  await dbMany(to.flatMap(x => [['LPUSH', 'inv:' + x, inv], ['LTRIM', 'inv:' + x, 0, INV_MAX - 1], ['EXPIRE', 'inv:' + x, INV_TTL]]));
+  return { ok: true, n: to.length };
+}
+async function invGet(m) {
+  if (!(await lbAuth(m.pid, m.pkey))) return { error: 'auth' };
+  const L = (await db(['LRANGE', 'inv:' + m.pid, 0, INV_MAX - 1])) || [];
+  if (L.length) await db(['DEL', 'inv:' + m.pid]);
+  const now = Date.now(), list = [];
+  L.forEach(x => { try { const o = JSON.parse(x); if (o && now - o.at < INV_TTL * 1000 && rooms.has(o.code) && !list.some(y => y.code === o.code)) list.push(o); } catch (e) {} });
+  return { list };
+}
+// ---------- comparaison de l'Examen du jour ----------
+// un score par joueur et par jour (le premier envoyé compte), en dixièmes de point (0 à 100) ; gardé 3 jours
+const DSC_KINDS = { exam: 100 };
+async function dayStats(k, d, mine) {
+  const V = ((await db(['HVALS', 'dsc:' + k + ':' + d])) || []).map(Number).filter(Number.isFinite);
+  const hist = new Array(11).fill(0); let sum = 0, below = 0, eq = 0;
+  V.forEach(v => { sum += v; hist[Math.max(0, Math.min(10, Math.round(v / 10)))]++; if (mine != null) { if (v < mine) below++; else if (v === mine) eq++; } });
+  return { n: V.length, avg: V.length ? Math.round(sum / V.length) : 0, hist, below, eq };
+}
+async function daySub(m) {
+  if (!(await lbAuth(m.pid, m.pkey))) return { error: 'auth' };
+  const max = DSC_KINDS[m.k]; if (!max || !dayOk(m.d)) return { error: 'bad' };
+  const s = Math.round(+m.s); if (!(s >= 0 && s <= max)) return { error: 'bad' };
+  const key = 'dsc:' + m.k + ':' + m.d;
+  await dbMany([['HSETNX', key, m.pid, s], ['EXPIRE', key, 3 * 86400]]);
+  const mine = +(await db(['HGET', key, m.pid]));
+  return Object.assign({ mine }, await dayStats(m.k, m.d, mine));
+}
+async function dayGet(m) {
+  if (!DSC_KINDS[m.k] || !dayOk(m.d)) return { error: 'bad' };
+  let mine = null; if (okId(m.pid)) { const v = await db(['HGET', 'dsc:' + m.k + ':' + m.d, m.pid]); if (v != null) mine = +v; }
+  return Object.assign({ mine }, await dayStats(m.k, m.d, mine));
+}
+const DATA_OPS = { giftget: giftGet, rep: repPut, stat: statPut, lbadm: lbAdmin, lgnew: lgNew, lgjoin: lgJoin, lgget: lgGet, lgput: lgPut, lgleave: lgLeave, clubm: clubMembers, clubq: clubSearch, sugg: suggAdd, sggl: suggList, lbput: lbPut, lbget: lbGet, lbdel: lbDel, cdel: cloudDel, cnew: cloudNew, cput: cloudPut, cget: cloudGet, clink: cloudLink, cjoin: cloudJoin, crk: cloudKey, crj: cloudRecover, cgoo: cloudGoogle, invsend: invSend, invget: invGet, dsc: daySub, dsg: dayGet };
+
+const createdBy = new Map(); // identifiant de création -> code (évite les salons en double après une coupure)
+const rooms = new Map(); // code -> {code, created, touched, players: [{id, token, name, ws, seat, leftAt}], log: []}
+
+function makeCode() {
+  for (let n = 0; n < 50; n++) {
+    let c = '';
+    for (let i = 0; i < 5; i++) c += CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)];
+    if (!rooms.has(c)) return c;
+  }
+  throw new Error('no code');
+}
+const rid = () => Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 10);
+const send = (ws, msg) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg)); };
+const others = (room, me) => room.players.filter(p => p !== me);
+const publicPlayers = room => room.players.map(p => ({ seat: p.seat, name: p.name, online: !!(p.ws && p.ws.readyState === 1) }));
+const hostOf = room => room.players.reduce((a, p) => (!a || p.seat < a.seat ? p : a), null);
+// Liste des salons pour l'écran « Jouer en ligne » : le code n'est donné que pour les salons publics
+function roomList() {
+  const out = [];
+  for (const r of rooms.values()) {
+    if (!r.players.some(p => p.ws && p.ws.readyState === 1)) continue;
+    const h = hostOf(r), m = r.meta || {};
+    out.push({ code: m.pub ? r.code : null, pub: !!m.pub, host: h ? h.name : '?', n: r.players.length, on: r.players.filter(p => p.ws && p.ws.readyState === 1).length, cap: m.cap || 2, game: m.game || 'radar', started: !!m.started, created: r.created });
+  }
+  return out.sort((a, b) => (b.pub - a.pub) || (a.started - b.started) || (b.created - a.created)).slice(0, 30).map(({ created, ...x }) => x);
+}
+function broadcastPresence(room) { room.players.forEach(p => send(p.ws, { t: 'presence', players: publicPlayers(room) })); }
+
+const server = http.createServer((req, res) => {
+  const cors = { 'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET,POST,OPTIONS', 'access-control-allow-headers': 'content-type', 'cache-control': 'no-store' };
+  if (req.method === 'OPTIONS') { res.writeHead(204, cors); res.end(); return; }
+  if (req.url === '/xfer' && req.method === 'POST') {
+    let body = '', big = false;
+    req.on('data', d => { if (big) return; body += d; if (body.length > XFER_MAX_BYTES) { big = true; res.writeHead(413, cors); res.end('{"error":"too big"}'); req.destroy(); } });
+    req.on('end', () => {
+      if (big) return;
+      if (!/^(FQZ\d-|FQSAVE\d\.)/.test(body)) { res.writeHead(400, { ...cors, 'content-type': 'application/json' }); res.end('{"error":"bad"}'); return; }
+      if (xfers.size > 5000) { res.writeHead(503, cors); res.end('{"error":"busy"}'); return; }
+      xferPut(body).then(code => { res.writeHead(200, { ...cors, 'content-type': 'application/json' }); res.end(JSON.stringify({ code, ttl: XFER_TTL_MS })); },
+        () => { res.writeHead(503, cors); res.end('{"error":"busy"}'); });
+    });
+    return;
+  }
+  const xm = req.url.match(/^\/xfer\/([A-Za-z0-9]{6})$/);
+  if (xm && req.method === 'GET') {
+    xferGet(xm[1]).then(data => {
+      if (!data) { res.writeHead(404, { ...cors, 'content-type': 'application/json' }); res.end('{"error":"not found"}'); return; }
+      res.writeHead(200, { ...cors, 'content-type': 'text/plain; charset=utf-8' }); res.end(data);
+    }, () => { res.writeHead(503, cors); res.end('{"error":"busy"}'); });
+    return;
+  }
+  if (req.url === '/rooms') {
+    res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*', 'cache-control': 'no-store' });
+    res.end(JSON.stringify({ rooms: roomList() }));
+    return;
+  }
+  const sm = req.url.match(/^\/stats\?k=([^&]+)(?:&j=(\d+))?$/);
+  if (sm && req.method === 'GET') {
+    let key = ''; try { key = decodeURIComponent(sm[1]); } catch (e) {}
+    if (!ADMIN_KEY || sha(key) !== sha(ADMIN_KEY)) { res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' }); res.end('Clé incorrecte.'); return; }
+    statPage(Math.min(90, Math.max(7, +sm[2] || 30))).then(h => { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }); res.end(h); },
+      e => { console.error('stats', e.message); res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8' }); res.end('Base indisponible.'); });
+    return;
+  }
+  const rm = req.url.match(/^\/reports\?k=([^&]+)$/);
+  if (rm && req.method === 'GET') {
+    let key = ''; try { key = decodeURIComponent(rm[1]); } catch (e) {}
+    if (!ADMIN_KEY || sha(key) !== sha(ADMIN_KEY)) { res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' }); res.end('Clé incorrecte.'); return; }
+    repPage().then(h => { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }); res.end(h); },
+      e => { console.error('reports', e.message); res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8' }); res.end('Base indisponible.'); });
+    return;
+  }
+  if (req.url === '/health') {
+    res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+    res.end(JSON.stringify({ ok: true, v: '1.16', google: !!GOOGLE_CLIENT_ID, rooms: rooms.size, uptime: Math.round(process.uptime()), db: DB_ON ? 'upstash' : 'memoire' }));
+    return;
+  }
+  res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+  res.end('Serveur F-QUIZ en ligne.');
+});
+
+const wss = new WebSocketServer({ server, maxPayload: XFER_MAX_BYTES + 4096 });
+
+wss.on('connection', (ws) => {
+  let room = null, me = null, bucket = [];
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+
+  ws.on('message', (raw) => {
+    const now = Date.now();
+    bucket = bucket.filter(t => now - t < 10000); bucket.push(now);
+    if (bucket.length > MAX_MSGS_PER_10S) { send(ws, { t: 'error', code: 'flood', msg: 'Trop de messages' }); return; }
+    let m; try { m = JSON.parse(raw); } catch (e) { return; }
+    if (!m || typeof m.t !== 'string') return;
+    if (raw.length > MAX_MSG_BYTES && m.t !== 'xput' && m.t !== 'cput') return;
+    if (DATA_OPS[m.t]) {
+      DATA_OPS[m.t](m).then(r => send(ws, Object.assign({ t: m.t, id: m.id }, r)), e => { console.error(m.t, e.message); send(ws, { t: m.t, id: m.id, error: 'server' }); });
+      return;
+    }
+
+    switch (m.t) {
+      // Même service que GET /rooms et /xfer, mais par WebSocket : pour les appareils (certains iPhone/iPad) qui bloquent les requêtes HTTP depuis un fichier local
+      case 'rooms': send(ws, { t: 'rooms', id: m.id, rooms: roomList() }); break;
+      case 'xput': {
+        const data = String(m.data || '');
+        if (!/^(FQZ\d-|FQSAVE\d\.)/.test(data) || data.length > XFER_MAX_BYTES) { send(ws, { t: 'xput', id: m.id, error: 'bad' }); break; }
+        if (xfers.size > 5000) { send(ws, { t: 'xput', id: m.id, error: 'busy' }); break; }
+        xferPut(data).then(code => send(ws, { t: 'xput', id: m.id, code, ttl: XFER_TTL_MS }), () => send(ws, { t: 'xput', id: m.id, error: 'busy' }));
+        break;
+      }
+      case 'xget': {
+        xferGet(m.code).then(data => send(ws, data ? { t: 'xget', id: m.id, data } : { t: 'xget', id: m.id, error: 'not found' }), () => send(ws, { t: 'xget', id: m.id, error: 'server' }));
+        break;
+      }
+      case 'create': {
+        // Même demande renvoyée après une coupure (serveur qui se réveille) : on rend le salon déjà créé au lieu d'en ouvrir un second
+        const cid = String(m.cid || '').slice(0, 24), prevCode = cid && createdBy.get(cid), prev = prevCode && rooms.get(prevCode);
+        const host = prev && prev.players.find(p => p.cid === cid);
+        if (host) {
+          if (host.ws && host.ws !== ws) try { host.ws.close(4000, 'replaced'); } catch (e) {}
+          host.ws = ws; host.leftAt = null; room = prev; me = host; prev.touched = now;
+          send(ws, { t: 'joined', code: prev.code, seat: me.seat, token: me.token, players: publicPlayers(prev), resumed: true, log: prev.log.slice(-200) });
+          broadcastPresence(prev);
+          break;
+        }
+        const code = makeCode();
+        room = { code, created: now, touched: now, players: [], log: [], meta: { pub: false, game: 'radar', cap: 2, started: false } };
+        me = { id: rid(), token: rid(), name: cleanName(m.name || 'Joueur 1'), ws, seat: 1, leftAt: null, cid: cid || undefined };
+        room.players.push(me); rooms.set(code, room);
+        if (cid) { createdBy.set(cid, code); setTimeout(() => createdBy.delete(cid), 10 * 60 * 1000); }
+        send(ws, { t: 'joined', code, seat: 1, token: me.token, players: publicPlayers(room) });
+        break;
+      }
+      case 'join': {
+        const code = String(m.code || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+        const r = rooms.get(code);
+        if (!r) { send(ws, { t: 'error', code: 'no-room', msg: 'Aucun salon avec ce code' }); return; }
+        // Reprise de place après une coupure (même jeton)
+        const back = m.token && r.players.find(p => p.token === m.token);
+        if (back) {
+          if (back.ws && back.ws !== ws) try { back.ws.close(4000, 'replaced'); } catch (e) {}
+          back.ws = ws; back.leftAt = null; room = r; me = back; r.touched = now;
+          send(ws, { t: 'joined', code, seat: me.seat, token: me.token, players: publicPlayers(r), resumed: true, log: r.log.slice(-200) });
+          broadcastPresence(r);
+          return;
+        }
+        // Entrée depuis la liste publique : le salon doit être ouvert, pas commencé, avec une place libre
+        if (m.pub) {
+          const mt = r.meta || {};
+          if (!mt.pub) { send(ws, { t: 'error', code: 'no-room', msg: 'Ce salon n’est plus public' }); return; }
+          if (mt.started) { send(ws, { t: 'error', code: 'full', msg: 'La partie a déjà commencé' }); return; }
+          if (r.players.length >= (mt.cap || roomCap(r))) { send(ws, { t: 'error', code: 'full', msg: 'Ce salon est déjà complet' }); return; }
+        }
+        if (r.players.length >= roomCap(r)) { send(ws, { t: 'error', code: 'full', msg: 'Ce salon est déjà complet' }); return; }
+        let seat = 1; while (r.players.some(p => p.seat === seat)) seat++;
+        room = r; me = { id: rid(), token: rid(), name: cleanName(m.name || ('Joueur ' + seat)), ws, seat, leftAt: null };
+        r.players.push(me); r.players.sort((x, y) => x.seat - y.seat); r.touched = now;
+        send(ws, { t: 'joined', code, seat, token: me.token, players: publicPlayers(r) });
+        broadcastPresence(r);
+        break;
+      }
+      case 'msg': {
+        // Message de jeu relayé à l'adversaire (contenu libre, défini par le client) ; gardé pour les reprises
+        if (!room || !me) return;
+        room.touched = now;
+        const out = { t: 'msg', from: me.seat, seq: room.log.length + 1, body: m.body };
+        room.log.push(out); if (room.log.length > 500) room.log.shift();
+        others(room, me).forEach(p => send(p.ws, out));
+        send(ws, { t: 'ack', seq: out.seq, ref: m.ref });
+        break;
+      }
+      case 'meta': {
+        // Réglages du salon envoyés par l'hôte (plus petit siège) : public / jeu / places / partie lancée
+        if (!room || !me || hostOf(room) !== me) return;
+        room.meta = {
+          pub: !!m.pub,
+          game: String(m.game || 'radar').slice(0, 12),
+          cap: Math.max(2, Math.min(String(m.game) === 'club' ? CLUB_MAX : MAX_PLAYERS, +m.cap || 2)),
+          started: !!m.started
+        };
+        room.touched = now;
+        break;
+      }
+      case 'ping': send(ws, { t: 'pong', at: m.at }); break;
+      case 'leave': {
+        if (!room || !me) return;
+        room.players = room.players.filter(p => p !== me);
+        others(room, me).forEach(p => send(p.ws, { t: 'left', seat: me.seat }));
+        if (!room.players.length) rooms.delete(room.code); else broadcastPresence(room);
+        room = null; me = null;
+        break;
+      }
+    }
+  });
+
+  ws.on('close', () => {
+    if (room && me && me.ws === ws) { me.leftAt = Date.now(); broadcastPresence(room); }
+  });
+});
+
+// Battement de cœur (détecte les connexions mortes) + ménage des salons
+setInterval(() => {
+  wss.clients.forEach(ws => { if (!ws.isAlive) return ws.terminate(); ws.isAlive = false; try { ws.ping(); } catch (e) {} });
+  const now = Date.now();
+  for (const [code, r] of rooms) {
+    const gone = r.players.filter(p => p.leftAt && now - p.leftAt > RECONNECT_GRACE_MS);
+    if (gone.length) {
+      r.players = r.players.filter(p => !gone.includes(p));
+      // les joueurs restants voient tout de suite que la place est libérée
+      gone.forEach(g => r.players.forEach(p => send(p.ws, { t: 'left', seat: g.seat })));
+      if (r.players.length) broadcastPresence(r);
+    }
+    if (!r.players.length || now - r.touched > ROOM_TTL_MS) rooms.delete(code);
+  }
+}, 20000);
+
+server.listen(PORT, () => console.log(`F-QUIZ serveur prêt sur le port ${PORT} · données : ${DB_ON ? 'Upstash' : 'en mémoire'}`));
